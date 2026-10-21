@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [core] Ask again for an audio key whose answer is late, up to three times, instead of loading the track without decryption after the first timeout
 - [audio] Mark a download's first request as requested by its length rather than its end offset
 - [playback] Stop instead of skipping through the queue when Spotify refuses a track's audio key
 - [core] Reject an access-point handshake packet whose size is under four bytes or over 64 KiB, instead of panicking or allocating whatever size it names

@@ -36,6 +36,11 @@ impl From<AudioKeyError> for Error {
     }
 }
 
+/// How long one request waits for its key.
+const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Requests made for a key before it is given up as timed out.
+const KEY_REQUEST_ATTEMPTS: u32 = 3;
+
 component! {
     AudioKeyManager : AudioKeyManagerInner {
         sequence: SeqGenerator<u32> = SeqGenerator::new(0),
@@ -78,24 +83,34 @@ impl AudioKeyManager {
         Ok(())
     }
 
+    /// Asks for a file's key. An answer that is late is asked for again, up to
+    /// [`KEY_REQUEST_ATTEMPTS`] times in all: it is not a refusal, and the first
+    /// request after the connection was idle can wait behind the network's
+    /// retransmissions (as on a phone whose background network was cut).
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
-        let (tx, rx) = oneshot::channel();
+        for attempt in 1..=KEY_REQUEST_ATTEMPTS {
+            let (tx, rx) = oneshot::channel();
 
-        let seq = self.lock(move |inner| {
-            let seq = inner.sequence.get();
-            inner.pending.insert(seq, tx);
-            seq
-        });
+            let seq = self.lock(move |inner| {
+                let seq = inner.sequence.get();
+                inner.pending.insert(seq, tx);
+                seq
+            });
 
-        self.send_key_request(seq, track, file)?;
-        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
-        match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
-            Err(_) => {
-                error!("Audio key response timeout");
-                Err(AudioKeyError::Timeout.into())
+            self.send_key_request(seq, track, file)?;
+            match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
+                Ok(k) => return k?,
+                Err(_) => {
+                    // A late answer to this request is dropped by dispatch.
+                    self.lock(|inner| inner.pending.remove(&seq));
+                    if attempt < KEY_REQUEST_ATTEMPTS {
+                        warn!("Audio key response timeout, asking again");
+                    }
+                }
             }
-            Ok(k) => k?,
         }
+        error!("Audio key response timeout");
+        Err(AudioKeyError::Timeout.into())
     }
 
     fn send_key_request(&self, seq: u32, track: SpotifyId, file: FileId) -> Result<(), Error> {
