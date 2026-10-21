@@ -36,6 +36,10 @@ rustls-tls-webpki-roots = [
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
 
+# On Android, present the Linux desktop client (client ID, version, device
+# data, user agent) instead of the Android one. Has no effect elsewhere.
+android-as-linux = []
+
 # Internal features - these are not meant to be used by end users
 __rustls = []
 
