@@ -515,10 +515,23 @@ async fn connect(
 
     let stream = socket::connect(host, port, proxy).await?;
 
-    let (mut ws_tx, ws_rx) = tokio_tungstenite::client_async_tls(address.as_str(), stream)
-        .await?
-        .0
-        .split();
+    // With the platform's verifier, tungstenite is given it; otherwise it
+    // brings its own roots.
+    #[cfg(feature = "rustls-tls-platform-verifier")]
+    let connector = {
+        use rustls_platform_verifier::ConfigVerifierExt;
+        let config = rustls::ClientConfig::with_platform_verifier()
+            .map_err(|e| WsError::Io(std::io::Error::other(e)))?;
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+    };
+    #[cfg(not(feature = "rustls-tls-platform-verifier"))]
+    let connector = None;
+
+    let (mut ws_tx, ws_rx) =
+        tokio_tungstenite::client_async_tls_with_config(address.as_str(), stream, None, connector)
+            .await?
+            .0
+            .split();
 
     let (send_tx, mut send_rx) = mpsc::unbounded_channel::<WsMessage>();
 

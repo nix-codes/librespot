@@ -69,6 +69,14 @@ rustls-tls-webpki-roots = [
     "librespot-core/rustls-tls-webpki-roots",
     "librespot-oauth/rustls-tls-webpki-roots",
 ]
+# rustls-tls-platform-verifier: Uses rustls with the platform's own certificate verifier
+# (rustls-platform-verifier): Android's trust manager, and the Apple and Windows verifiers. Takes
+# precedence over the two above when enabled with them. On Android, the app must initialize
+# rustls-platform-verifier and include its Kotlin component (see that crate's README).
+rustls-tls-platform-verifier = [
+    "librespot-core/rustls-tls-platform-verifier",
+    "librespot-oauth/rustls-tls-platform-verifier",
+]
 
 # Audio backends - see README.md for audio backend selection guide
 # Cross-platform backends:

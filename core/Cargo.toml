@@ -35,6 +35,19 @@ rustls-tls-webpki-roots = [
     "librespot-oauth/rustls-tls-webpki-roots",
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
+# The platform's own verifier, for Spotify's servers; takes precedence over
+# the other rustls features. A TLS proxy is still checked against the
+# system's roots. On Android the app must initialize
+# rustls-platform-verifier and ship its component.
+rustls-tls-platform-verifier = [
+    "__rustls",
+    "hyper-proxy2/rustls",
+    "hyper-rustls/rustls-platform-verifier",
+    "librespot-oauth/rustls-tls-platform-verifier",
+    "tokio-tungstenite/__rustls-tls",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
+]
 
 # On Android, present the Linux desktop client (client ID, version, device
 # data, user agent) instead of the Android one. Has no effect elsewhere.
@@ -92,6 +105,8 @@ protobuf-json-mapping = "3.7"
 quick-xml = { version = "0.38", features = ["serialize"] }
 rand = { version = "0.9", default-features = false, features = ["thread_rng"] }
 rsa = "0.9"
+rustls = { version = "0.23", default-features = false, optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = { version = "0.10", features = ["oid"] }

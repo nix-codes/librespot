@@ -150,9 +150,20 @@ impl HttpClient {
 
         #[cfg(all(feature = "__rustls", not(feature = "native-tls")))]
         let https_connector = {
-            #[cfg(feature = "rustls-tls-native-roots")]
+            #[cfg(feature = "rustls-tls-platform-verifier")]
+            let tls = HttpsConnectorBuilder::new()
+                .try_with_platform_verifier()
+                .map_err(Error::unavailable)?;
+            #[cfg(all(
+                feature = "rustls-tls-native-roots",
+                not(feature = "rustls-tls-platform-verifier")
+            ))]
             let tls = HttpsConnectorBuilder::new().with_native_roots()?;
-            #[cfg(feature = "rustls-tls-webpki-roots")]
+            #[cfg(all(
+                feature = "rustls-tls-webpki-roots",
+                not(feature = "rustls-tls-platform-verifier"),
+                not(feature = "rustls-tls-native-roots")
+            ))]
             let tls = HttpsConnectorBuilder::new().with_webpki_roots();
             tls.https_or_http().enable_http1().enable_http2().build()
         };

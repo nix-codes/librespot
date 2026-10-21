@@ -24,6 +24,15 @@ rustls-tls-webpki-roots = [
     "oauth2/rustls-tls",
     "reqwest/rustls-tls-webpki-roots",
 ]
+# The platform's own verifier (Android's trust manager, the Windows and
+# Apple ones); takes precedence over the other rustls features. On Android
+# the app must initialize rustls-platform-verifier and ship its component.
+rustls-tls-platform-verifier = [
+    "__rustls",
+    "reqwest/rustls-tls-manual-roots",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
+]
 
 # Internal features - these are not meant to be used by end users
 __rustls = []
@@ -38,6 +47,8 @@ open = "5.3"
 reqwest = { version = "0.12", default-features = false, features = [
     "system-proxy",
 ] }
+rustls = { version = "0.23", default-features = false, optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
 thiserror = "2"
 # The device flow's async poll needs a timer to wait between polls.
 tokio = { version = "1", features = ["time"] }
