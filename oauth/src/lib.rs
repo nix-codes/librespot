@@ -277,6 +277,7 @@ pub struct OAuthClient {
     scopes: Vec<String>,
     redirect_uri: String,
     should_open_url: bool,
+    url_handler: Option<UrlHandler>,
     message: String,
     client: BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>,
 }
@@ -328,6 +329,10 @@ impl OAuthClient {
             .set_pkce_challenge(pkce_challenge)
             .url();
 
+        if let Some(handler) = &self.url_handler {
+            handler(auth_url.as_str());
+            return pkce_verifier;
+        }
         if self.should_open_url {
             open::that_in_background(auth_url.as_str());
         }
@@ -428,8 +433,12 @@ pub struct OAuthClientBuilder {
     redirect_uri: String,
     scopes: Vec<String>,
     should_open_url: bool,
+    url_handler: Option<UrlHandler>,
     message: String,
 }
+
+/// Called with the authorization URL, in place of opening or printing it.
+pub type UrlHandler = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 impl OAuthClientBuilder {
     /// Create a new OAuthClientBuilder with provided params and default config.
@@ -441,6 +450,7 @@ impl OAuthClientBuilder {
             redirect_uri: redirect_uri.to_string(),
             scopes: scopes.into_iter().map(Into::into).collect(),
             should_open_url: false,
+            url_handler: None,
             message: String::from("Go back to your terminal :)"),
         }
     }
@@ -449,6 +459,14 @@ impl OAuthClientBuilder {
     /// opened with the default web browser. Otherwise, it will be printed to standard output.
     pub fn open_in_browser(mut self) -> Self {
         self.should_open_url = true;
+        self
+    }
+
+    /// When this function is added to the building process pipeline, the auth url is handed to
+    /// `handler` and neither opened nor printed: for apps that show it themselves, or open it
+    /// where the default web browser can't be reached (such as Android).
+    pub fn with_url_handler(mut self, handler: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.url_handler = Some(std::sync::Arc::new(handler));
         self
     }
 
@@ -480,6 +498,7 @@ impl OAuthClientBuilder {
         Ok(OAuthClient {
             scopes: self.scopes,
             should_open_url: self.should_open_url,
+            url_handler: self.url_handler,
             message: self.message,
             redirect_uri: self.redirect_uri,
             client,
@@ -802,6 +821,27 @@ mod test {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use super::*;
+
+    #[test]
+    fn the_url_handler_is_given_the_authorization_url() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let client =
+            OAuthClientBuilder::new("abc123", "http://127.0.0.1:8898/login", vec!["streaming"])
+                .with_url_handler({
+                    let seen = std::sync::Arc::clone(&seen);
+                    move |url| *seen.lock().unwrap() = Some(url.to_string())
+                })
+                .build()
+                .unwrap();
+        client.set_auth_url();
+        let url = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the handler wasn't called");
+        assert!(url.starts_with(AUTH_URL));
+        assert!(url.contains("client_id=abc123"));
+    }
 
     #[test]
     fn debug_output_leaves_out_the_tokens() {
