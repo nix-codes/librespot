@@ -181,7 +181,11 @@ impl ConnectState {
         }
 
         if self.shuffling_context() {
-            self.set_current_track(current_index.unwrap_or_default())?;
+            // a song playing from the queue stays the current one, as in
+            // reset_playback_to_position
+            if !self.current_track(|t| t.is_queue()) {
+                self.set_current_track(current_index.unwrap_or_default())?;
+            }
             self.set_shuffle(true);
 
             match self.transfer_shuffle.take() {
