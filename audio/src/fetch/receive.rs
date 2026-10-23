@@ -30,6 +30,9 @@ enum ReceivedData {
     Throughput(usize),
     ResponseTime(Duration),
     Data(PartialFileData),
+    /// A request finished and gave its download slot back, so more can be
+    /// fetched ahead.
+    SlotFree,
 }
 
 const ONE_SECOND: Duration = Duration::from_secs(1);
@@ -139,6 +142,15 @@ async fn receive_data(
     }
 
     drop(permit);
+
+    // The data above was sent while this request still held its slot, so the
+    // fetch loop may have found none free and fetched nothing more ahead.
+    // Without a word now, it waits for the reader's next request, and only a
+    // few seconds ahead of playback are ever downloaded. After an error,
+    // stay quiet: fetching again at once would spin while offline.
+    if result.is_ok() {
+        let _ = file_data_tx.send(ReceivedData::SlotFree);
+    }
 
     if let Err(e) = result {
         error!(
@@ -353,6 +365,7 @@ impl AudioFileFetch {
                 // store our new estimate for everyone to see
                 self.shared.set_ping_time(ping_time);
             }
+            ReceivedData::SlotFree => (),
             ReceivedData::Data(data) => {
                 match self.output.as_mut() {
                     Some(output) => {
