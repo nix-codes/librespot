@@ -2483,6 +2483,12 @@ impl SpircTask {
 
         self.connect_state.set_now(self.now_ms() as u64);
 
+        // shown to watchers too, before Spotify answers: a resume's player
+        // event doesn't publish when playback starts where expected
+        if self.connect_state.is_active() {
+            self.publish_active_state(None);
+        }
+
         self.connect_state
             .send_state(&self.session)
             .await
