@@ -193,6 +193,9 @@ struct SpircTask {
 
     play_request_id: Option<u64>,
     play_status: SpircPlayStatus,
+    /// Whether the player was last asked to play or to pause: its events
+    /// saying otherwise are from before, and arrive late.
+    asked_playing: Option<bool>,
 
     connection_id_update: BoxedStreamResult<String>,
     connect_state_update: BoxedStreamResult<ClusterUpdate>,
@@ -481,6 +484,7 @@ impl Spirc {
             connect_established: false,
 
             play_request_id: None,
+            asked_playing: None,
             play_status: SpircPlayStatus::Stopped,
 
             connection_id_update,
@@ -1155,6 +1159,18 @@ impl SpircTask {
         // mess with it.
         if event.get_play_request_id().is_some() && !is_current_track {
             return Ok(());
+        }
+
+        // a pause and a play in quick succession: the pause's event may
+        // arrive after the play, and would leave the state paused while the
+        // player plays
+        match (&event, self.asked_playing) {
+            (PlayerEvent::Paused { .. }, Some(true))
+            | (PlayerEvent::Playing { .. }, Some(false)) => {
+                debug!("ignoring a late player event: {event:?}");
+                return Ok(());
+            }
+            _ => {}
         }
 
         match event {
@@ -1839,6 +1855,7 @@ impl SpircTask {
 
     fn handle_stop(&mut self) {
         self.player.stop();
+        self.asked_playing = None;
         self.connect_state.update_position(0, self.now_ms());
         self.connect_state.clear_next_tracks();
 
@@ -2055,6 +2072,7 @@ impl SpircTask {
                 preloading_of_next_track_triggered,
             } => {
                 self.player.play();
+                self.asked_playing = Some(true);
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
                 self.play_status = SpircPlayStatus::Playing {
@@ -2064,6 +2082,7 @@ impl SpircTask {
             }
             SpircPlayStatus::LoadingPause { position_ms } => {
                 self.player.play();
+                self.asked_playing = Some(true);
                 self.play_status = SpircPlayStatus::LoadingPlay { position_ms };
             }
             _ => return,
@@ -2094,6 +2113,7 @@ impl SpircTask {
                 preloading_of_next_track_triggered,
             } => {
                 self.player.pause();
+                self.asked_playing = Some(false);
                 let position_ms = (self.now_ms() - nominal_start_time) as u32;
                 self.connect_state
                     .update_position(position_ms, self.now_ms());
@@ -2104,6 +2124,7 @@ impl SpircTask {
             }
             SpircPlayStatus::LoadingPlay { position_ms } => {
                 self.player.pause();
+                self.asked_playing = Some(false);
                 self.play_status = SpircPlayStatus::LoadingPause { position_ms };
             }
             _ => (),
@@ -2459,6 +2480,7 @@ impl SpircTask {
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
         self.player.load(id, start_playing, position_ms);
+        self.asked_playing = Some(start_playing);
 
         self.connect_state
             .update_position(position_ms, self.now_ms());
