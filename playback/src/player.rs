@@ -20,10 +20,7 @@ use std::{
 #[cfg(feature = "passthrough-decoder")]
 use crate::decoder::PassthroughDecoder;
 use crate::{
-    audio::{
-        AudioDecrypt, AudioFetchParams, AudioFile, AudioFileError, AudioFileHead,
-        StreamLoaderController,
-    },
+    audio::{AudioDecrypt, AudioFetchParams, AudioFile, AudioFileHead, StreamLoaderController},
     audio_backend::Sink,
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
@@ -32,7 +29,7 @@ use crate::{
         audio_key::{AudioKey, AudioKeyError},
         util::SeqGenerator,
     },
-    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, SymphoniaDecoder},
+    decoder::{AudioDecoder, AudioPacket, AudioPacketPosition, DecoderError, SymphoniaDecoder},
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
@@ -250,6 +247,9 @@ pub enum PlayerEvent {
     EndOfTrack {
         play_request_id: u64,
         track_id: SpotifyUri,
+        // The audio stopped coming (the network went, or is too slow), so
+        // the track was cut short where it had got to, not played out.
+        stalled: bool,
     },
     // The player was unable to load the requested track.
     Unavailable {
@@ -1382,7 +1382,11 @@ impl PlayerTrackLoader {
                 Ok(audio_file) => audio_file,
                 Err(e) => {
                     error!("PlayerTrackLoader::load_track error opening subfile: {e}");
-                    return Err(LoadError::Unavailable);
+                    return Err(if stream_loader_controller.stalled() {
+                        LoadError::Unreachable
+                    } else {
+                        LoadError::Unavailable
+                    });
                 }
             };
 
@@ -1446,11 +1450,7 @@ impl PlayerTrackLoader {
                 }
                 Err(e) => {
                     error!("Unable to read audio file: {e}");
-                    // The decoder keeps only the message of a read that gave
-                    // up waiting for the audio to download.
-                    unreachable |= e
-                        .to_string()
-                        .contains(&AudioFileError::WaitTimeout.to_string());
+                    unreachable |= stream_loader_controller.stalled();
                     return Err(LoadError::after_decoder_failure(
                         audio_key_unavailable,
                         unreachable,
@@ -1481,7 +1481,11 @@ impl PlayerTrackLoader {
                     error!(
                         "PlayerTrackLoader::load_track error seeking to starting position {position_ms}: {e}"
                     );
-                    return Err(LoadError::Unavailable);
+                    return Err(if stream_loader_controller.stalled() {
+                        LoadError::Unreachable
+                    } else {
+                        LoadError::Unavailable
+                    });
                 }
             };
 
@@ -1828,6 +1832,7 @@ impl Future for PlayerInternal {
                                             self.send_event(PlayerEvent::EndOfTrack {
                                                 track_id,
                                                 play_request_id,
+                                                stalled: false,
                                             })
                                         }
                                     }
@@ -1843,6 +1848,7 @@ impl Future for PlayerInternal {
                             self.send_event(PlayerEvent::EndOfTrack {
                                 track_id,
                                 play_request_id,
+                                stalled: matches!(e, DecoderError::Stalled(_)),
                             })
                         }
                     }
@@ -2159,6 +2165,7 @@ impl PlayerInternal {
                     self.send_event(PlayerEvent::EndOfTrack {
                         track_id: track_id.clone(),
                         play_request_id,
+                        stalled: false,
                     })
                 } else {
                     error!("PlayerInternal handle_packet: Invalid PlayerState");
@@ -2722,6 +2729,7 @@ impl PlayerInternal {
                             self.send_event(PlayerEvent::EndOfTrack {
                                 track_id,
                                 play_request_id,
+                                stalled: false,
                             })
                         }
                     }
@@ -3049,6 +3057,24 @@ mod tests {
             LoadError::after_decoder_failure(false, true),
             LoadError::Unreachable
         );
+    }
+
+    #[test]
+    fn a_read_that_gave_up_waiting_for_audio_is_a_stall() {
+        use crate::decoder::DecoderError;
+        use symphonia::core::errors::Error as SymphoniaError;
+
+        let timed_out = SymphoniaError::IoError(io::Error::from(io::ErrorKind::TimedOut));
+        let corrupt = SymphoniaError::IoError(io::Error::from(io::ErrorKind::InvalidData));
+
+        assert!(matches!(
+            DecoderError::from(timed_out),
+            DecoderError::Stalled(_)
+        ));
+        assert!(matches!(
+            DecoderError::from(corrupt),
+            DecoderError::SymphoniaDecoder(_)
+        ));
     }
 
     #[test]

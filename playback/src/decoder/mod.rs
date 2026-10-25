@@ -16,6 +16,9 @@ pub enum DecoderError {
     PassthroughDecoder(String),
     #[error("Symphonia Decoder Error: {0}")]
     SymphoniaDecoder(String),
+    /// A read gave up waiting for the audio to download.
+    #[error("Audio Stalled: {0}")]
+    Stalled(String),
 }
 
 pub type DecoderResult<T> = Result<T, DecoderError>;
@@ -87,6 +90,13 @@ impl From<DecoderError> for librespot_core::error::Error {
 
 impl From<symphonia::core::errors::Error> for DecoderError {
     fn from(err: symphonia::core::errors::Error) -> Self {
-        Self::SymphoniaDecoder(err.to_string())
+        match err {
+            symphonia::core::errors::Error::IoError(err)
+                if err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Self::Stalled(err.to_string())
+            }
+            err => Self::SymphoniaDecoder(err.to_string()),
+        }
     }
 }

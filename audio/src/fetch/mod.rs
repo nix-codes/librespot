@@ -307,6 +307,15 @@ impl StreamLoaderController {
         }
     }
 
+    /// Whether a read gave up waiting for the audio to download, as when
+    /// the network went: a decoder failing after that may have found
+    /// nothing wrong with the file but its missing data.
+    pub fn stalled(&self) -> bool {
+        self.stream_shared
+            .as_ref()
+            .is_some_and(|shared| shared.stalled.load(Ordering::Acquire))
+    }
+
     pub fn ping_time(&self) -> Option<Duration> {
         self.stream_shared.as_ref().map(|shared| shared.ping_time())
     }
@@ -355,6 +364,7 @@ impl StreamLoaderController {
 
                 download_status = new_download_status;
                 if wait_result.timed_out() {
+                    shared.stalled.store(true, Ordering::Release);
                     return Err(AudioFileError::WaitTimeout.into());
                 }
 
@@ -450,6 +460,8 @@ struct AudioFileShared {
     ping_time_ms: AtomicUsize,
     read_position: AtomicUsize,
     throughput: AtomicUsize,
+    /// A read gave up waiting for the audio to download.
+    stalled: AtomicBool,
 }
 
 impl AudioFileShared {
@@ -468,6 +480,7 @@ impl AudioFileShared {
             ping_time_ms: AtomicUsize::new(0),
             read_position: AtomicUsize::new(0),
             throughput: AtomicUsize::new(0),
+            stalled: AtomicBool::new(false),
         }
     }
 
@@ -802,6 +815,7 @@ impl Read for AudioFileStreaming {
 
             download_status = new_download_status;
             if wait_result.timed_out() {
+                self.shared.stalled.store(true, Ordering::Release);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     Error::deadline_exceeded(AudioFileError::WaitTimeout),
