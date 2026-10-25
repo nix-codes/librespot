@@ -20,7 +20,10 @@ use std::{
 #[cfg(feature = "passthrough-decoder")]
 use crate::decoder::PassthroughDecoder;
 use crate::{
-    audio::{AudioDecrypt, AudioFetchParams, AudioFile, AudioFileHead, StreamLoaderController},
+    audio::{
+        AudioDecrypt, AudioFetchParams, AudioFile, AudioFileError, AudioFileHead,
+        StreamLoaderController,
+    },
     audio_backend::Sink,
     config::{Bitrate, NormalisationMethod, NormalisationType, PlayerConfig},
     convert::Converter,
@@ -252,6 +255,9 @@ pub enum PlayerEvent {
     Unavailable {
         play_request_id: u64,
         track_id: SpotifyUri,
+        // Spotify couldn't be reached to load it: it may well play later,
+        // unlike a track Spotify said can't be played.
+        unreachable: bool,
     },
     // Spotify refused the key required to decrypt the requested track.
     AudioKeyUnavailable {
@@ -777,15 +783,45 @@ struct PlayerLoadedTrackData {
 enum LoadError {
     Unavailable,
     AudioKeyUnavailable,
+    /// Spotify couldn't be reached: the network is down, or too slow.
+    Unreachable,
 }
 
 impl LoadError {
-    fn after_decoder_failure(audio_key_unavailable: bool) -> Self {
+    fn after_decoder_failure(audio_key_unavailable: bool, unreachable: bool) -> Self {
         if audio_key_unavailable {
             Self::AudioKeyUnavailable
+        } else if unreachable {
+            Self::Unreachable
         } else {
             Self::Unavailable
         }
+    }
+
+    /// Unavailable, or Unreachable when `error` came of not reaching
+    /// Spotify rather than of its answer.
+    fn from_error(error: &Error) -> Self {
+        if is_unreachable(error) {
+            Self::Unreachable
+        } else {
+            Self::Unavailable
+        }
+    }
+}
+
+/// Whether `error` came of not reaching Spotify (no connection, a timeout,
+/// a dropped connection, an overloaded server) rather than of its answer
+/// (not found, refused, undecodable).
+fn is_unreachable(error: &Error) -> bool {
+    use crate::core::error::ErrorKind;
+    match error.kind {
+        ErrorKind::Unavailable
+        | ErrorKind::DeadlineExceeded
+        | ErrorKind::Aborted
+        | ErrorKind::Cancelled
+        | ErrorKind::ResourceExhausted => true,
+        ErrorKind::Unknown => error.is_transport(),
+        _ => false,
     }
 }
 
@@ -1143,7 +1179,7 @@ impl PlayerTrackLoader {
             },
             Err(e) => {
                 error!("Unable to load audio item: {e:?}");
-                return Err(LoadError::Unavailable);
+                return Err(LoadError::from_error(&e));
             }
         };
 
@@ -1299,7 +1335,7 @@ impl PlayerTrackLoader {
                 Ok(encrypted_file) => encrypted_file,
                 Err(e) => {
                     error!("Unable to load encrypted file: {e:?}");
-                    return Err(LoadError::Unavailable);
+                    return Err(LoadError::from_error(&e));
                 }
             };
 
@@ -1307,19 +1343,21 @@ impl PlayerTrackLoader {
 
             let stream_loader_controller = encrypted_file
                 .get_stream_loader_controller()
-                .map_err(|_| LoadError::Unavailable)?;
+                .map_err(|e| LoadError::from_error(&e))?;
 
             // Not all audio files are encrypted. If we can't get a key, try loading the track
             // without decryption. If the file was encrypted after all, the decoder will fail
             // parsing and bail out, so we should be safe from outputting ear-piercing noise.
-            let (key, audio_key_unavailable) = match prefetched_key {
-                Some(key) => (Some(key), false),
+            // A key that didn't come for want of a connection makes the
+            // decoder's failure, if it fails, the connection's too.
+            let (key, audio_key_unavailable, mut unreachable) = match prefetched_key {
+                Some(key) => (Some(key), false, false),
                 None => match self.session.audio_key().request(track_id, file_id).await {
-                    Ok(key) => (Some(key), false),
+                    Ok(key) => (Some(key), false, false),
                     Err(e) => {
                         let unavailable = Self::is_audio_key_unavailable(&e);
                         warn!("Unable to load key, continuing without decryption: {e}");
-                        (None, unavailable)
+                        (None, unavailable, !unavailable && is_unreachable(&e))
                     }
                 },
             };
@@ -1390,12 +1428,16 @@ impl PlayerTrackLoader {
                                 error!("Error removing file from cache");
                                 return Err(LoadError::after_decoder_failure(
                                     audio_key_unavailable,
+                                    unreachable,
                                 ));
                             }
                         }
                         None => {
                             error!("If the audio file is cached, a cache should exist");
-                            return Err(LoadError::after_decoder_failure(audio_key_unavailable));
+                            return Err(LoadError::after_decoder_failure(
+                                audio_key_unavailable,
+                                unreachable,
+                            ));
                         }
                     }
 
@@ -1404,7 +1446,15 @@ impl PlayerTrackLoader {
                 }
                 Err(e) => {
                     error!("Unable to read audio file: {e}");
-                    return Err(LoadError::after_decoder_failure(audio_key_unavailable));
+                    // The decoder keeps only the message of a read that gave
+                    // up waiting for the audio to download.
+                    unreachable |= e
+                        .to_string()
+                        .contains(&AudioFileError::WaitTimeout.to_string());
+                    return Err(LoadError::after_decoder_failure(
+                        audio_key_unavailable,
+                        unreachable,
+                    ));
                 }
             };
 
@@ -1611,11 +1661,14 @@ impl Future for PlayerInternal {
                                 exit(1);
                             }
                         }
-                        Poll::Ready(Err(LoadError::Unavailable)) => {
+                        Poll::Ready(Err(
+                            error @ (LoadError::Unavailable | LoadError::Unreachable),
+                        )) => {
                             error!("Skipping to next track, unable to load track <{track_id:?}>");
                             self.send_event(PlayerEvent::Unavailable {
                                 track_id,
                                 play_request_id,
+                                unreachable: error == LoadError::Unreachable,
                             })
                         }
                         Poll::Ready(Err(LoadError::AudioKeyUnavailable)) => {
@@ -1665,6 +1718,7 @@ impl Future for PlayerInternal {
                             self.send_event(PlayerEvent::Unavailable {
                                 track_id,
                                 play_request_id,
+                                unreachable: error == LoadError::Unreachable,
                             });
                         }
                     }
@@ -2974,6 +3028,7 @@ where
 mod tests {
     use super::{LoadError, PlayerEvent, PlayerTrackLoader};
     use crate::core::{Error, SpotifyUri, audio_key::AudioKeyError};
+    use std::io;
 
     #[test]
     fn only_an_explicit_audio_key_rejection_is_terminal() {
@@ -2983,13 +3038,35 @@ mod tests {
         assert!(PlayerTrackLoader::is_audio_key_unavailable(&rejected));
         assert!(!PlayerTrackLoader::is_audio_key_unavailable(&timeout));
         assert_eq!(
-            LoadError::after_decoder_failure(true),
+            LoadError::after_decoder_failure(true, false),
             LoadError::AudioKeyUnavailable
         );
         assert_eq!(
-            LoadError::after_decoder_failure(false),
+            LoadError::after_decoder_failure(false, false),
             LoadError::Unavailable
         );
+        assert_eq!(
+            LoadError::after_decoder_failure(false, true),
+            LoadError::Unreachable
+        );
+    }
+
+    #[test]
+    fn a_failed_connection_is_told_from_spotify_saying_no() {
+        let down = Error::from(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let timeout = Error::aborted(AudioKeyError::Timeout);
+        let unreachable_host = Error::from(io::Error::from(io::ErrorKind::HostUnreachable));
+        let not_found = Error::not_found("no such track");
+        let refused = Error::permission_denied("not in this country");
+
+        assert_eq!(LoadError::from_error(&down), LoadError::Unreachable);
+        assert_eq!(LoadError::from_error(&timeout), LoadError::Unreachable);
+        assert_eq!(
+            LoadError::from_error(&unreachable_host),
+            LoadError::Unreachable
+        );
+        assert_eq!(LoadError::from_error(&not_found), LoadError::Unavailable);
+        assert_eq!(LoadError::from_error(&refused), LoadError::Unavailable);
     }
 
     #[test]

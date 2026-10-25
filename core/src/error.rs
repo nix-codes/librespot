@@ -91,6 +91,15 @@ impl fmt::Display for ErrorMessage {
 }
 
 impl Error {
+    /// Whether this is the network's error (a connection or transfer
+    /// failing) rather than an answer, for errors whose kind doesn't say.
+    pub fn is_transport(&self) -> bool {
+        let error = self.error.as_ref();
+        error.is::<hyper_util::client::legacy::Error>()
+            || error.is::<hyper::Error>()
+            || error.is::<std::io::Error>()
+    }
+
     pub fn new<E>(kind: ErrorKind, error: E) -> Error
     where
         E: Into<Box<dyn error::Error + Send + Sync>>,
