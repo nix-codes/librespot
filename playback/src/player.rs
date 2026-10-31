@@ -788,10 +788,8 @@ enum LoadError {
 }
 
 impl LoadError {
-    fn after_decoder_failure(audio_key_unavailable: bool, unreachable: bool) -> Self {
-        if audio_key_unavailable {
-            Self::AudioKeyUnavailable
-        } else if unreachable {
+    fn after_decoder_failure(unreachable: bool) -> Self {
+        if unreachable {
             Self::Unreachable
         } else {
             Self::Unavailable
@@ -1349,15 +1347,23 @@ impl PlayerTrackLoader {
             // without decryption. If the file was encrypted after all, the decoder will fail
             // parsing and bail out, so we should be safe from outputting ear-piercing noise.
             // A key that didn't come for want of a connection makes the
-            // decoder's failure, if it fails, the connection's too.
-            let (key, audio_key_unavailable, mut unreachable) = match prefetched_key {
-                Some(key) => (Some(key), false, false),
+            // decoder's failure, if it fails, the connection's too. A key
+            // Spotify refused ends the load here.
+            let (key, mut unreachable) = match prefetched_key {
+                Some(key) => (Some(key), false),
                 None => match self.session.audio_key().request(track_id, file_id).await {
-                    Ok(key) => (Some(key), false, false),
+                    Ok(key) => (Some(key), false),
+                    Err(e) if Self::is_audio_key_unavailable(&e) => {
+                        // Refused: the file can't be decrypted, and decoding
+                        // it encrypted would only download it while the
+                        // decoder looks through it for a format.
+                        warn!("Spotify refused the audio key of <{}>", audio_item.name);
+                        stream_loader_controller.close();
+                        return Err(LoadError::AudioKeyUnavailable);
+                    }
                     Err(e) => {
-                        let unavailable = Self::is_audio_key_unavailable(&e);
                         warn!("Unable to load key, continuing without decryption: {e}");
-                        (None, unavailable, !unavailable && is_unreachable(&e))
+                        (None, is_unreachable(&e))
                     }
                 },
             };
@@ -1430,18 +1436,12 @@ impl PlayerTrackLoader {
                         Some(cache) => {
                             if cache.remove_file(file_id).is_err() {
                                 error!("Error removing file from cache");
-                                return Err(LoadError::after_decoder_failure(
-                                    audio_key_unavailable,
-                                    unreachable,
-                                ));
+                                return Err(LoadError::after_decoder_failure(unreachable));
                             }
                         }
                         None => {
                             error!("If the audio file is cached, a cache should exist");
-                            return Err(LoadError::after_decoder_failure(
-                                audio_key_unavailable,
-                                unreachable,
-                            ));
+                            return Err(LoadError::after_decoder_failure(unreachable));
                         }
                     }
 
@@ -1451,10 +1451,7 @@ impl PlayerTrackLoader {
                 Err(e) => {
                     error!("Unable to read audio file: {e}");
                     unreachable |= stream_loader_controller.stalled();
-                    return Err(LoadError::after_decoder_failure(
-                        audio_key_unavailable,
-                        unreachable,
-                    ));
+                    return Err(LoadError::after_decoder_failure(unreachable));
                 }
             };
 
@@ -3046,15 +3043,11 @@ mod tests {
         assert!(PlayerTrackLoader::is_audio_key_unavailable(&rejected));
         assert!(!PlayerTrackLoader::is_audio_key_unavailable(&timeout));
         assert_eq!(
-            LoadError::after_decoder_failure(true, false),
-            LoadError::AudioKeyUnavailable
-        );
-        assert_eq!(
-            LoadError::after_decoder_failure(false, false),
+            LoadError::after_decoder_failure(false),
             LoadError::Unavailable
         );
         assert_eq!(
-            LoadError::after_decoder_failure(false, true),
+            LoadError::after_decoder_failure(true),
             LoadError::Unreachable
         );
     }

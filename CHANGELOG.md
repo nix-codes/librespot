@@ -31,12 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- [core] Keep the audio keys given while the program runs, across sessions, and don't ask Spotify again for a file's key
 - [core] Leave access tokens, refresh tokens and credentials' auth data out of `Debug` output, and so out of trace logs
 - [core] An HTTP 409 Conflict answer is an `Aborted` error instead of `Unknown`
 - [core] Made `SpotifyId::to_base62`, `SpotifyId::to_base16`, `FileId::to_base16`, `SpotifyUri::to_id`, `SpotifyUri::to_uri` infallible (breaking)
 
 ### Fixed
 
+- [playback] End the load as soon as Spotify refuses a track's audio key, instead of decoding the encrypted file, which downloaded it, logged MP3 junk while the decoder searched it for a format, and could delete a good cached file
 - [audio] Drop the downloads a seek left behind before they start, and fetch small blocks while the decoder looks for its place, so many seeks in a row no longer stall playback behind downloads of parts it left
 - [core] Ask again for an audio key whose answer is late, up to three times, instead of loading the track without decryption after the first timeout
 - [audio] Mark a download's first request as requested by its length rather than its end offset

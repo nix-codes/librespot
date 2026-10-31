@@ -1,4 +1,9 @@
-use std::{collections::HashMap, io::Write, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Write,
+    sync::{LazyLock, Mutex},
+    time::Duration,
+};
 
 use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use bytes::Bytes;
@@ -40,6 +45,38 @@ impl From<AudioKeyError> for Error {
 const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Requests made for a key before it is given up as timed out.
 const KEY_REQUEST_ATTEMPTS: u32 = 3;
+/// Keys kept for files loaded again (see [`KEYS`]).
+const KEPT_KEYS: usize = 1024;
+
+/// The keys given, by file, the most recent last.
+#[derive(Default)]
+struct Keys {
+    keys: HashMap<FileId, AudioKey>,
+    order: VecDeque<FileId>,
+}
+
+impl Keys {
+    fn get(&self, file: FileId) -> Option<AudioKey> {
+        self.keys.get(&file).copied()
+    }
+
+    fn keep(&mut self, file: FileId, key: AudioKey) {
+        if self.keys.insert(file, key).is_none() {
+            self.order.push_back(file);
+        }
+        while self.order.len() > KEPT_KEYS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.keys.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// The keys given while the program runs, across sessions. A file's key
+/// never changes, so a track loaded again (a seek while it loads, a retry, a
+/// reconnect, a prefetch and then the load) needn't ask for it again: each
+/// request counts towards the ones Spotify refuses when they come too often.
+static KEYS: LazyLock<Mutex<Keys>> = LazyLock::new(Mutex::default);
 
 component! {
     AudioKeyManager : AudioKeyManagerInner {
@@ -87,7 +124,11 @@ impl AudioKeyManager {
     /// [`KEY_REQUEST_ATTEMPTS`] times in all: it is not a refusal, and the first
     /// request after the connection was idle can wait behind the network's
     /// retransmissions (as on a phone whose background network was cut).
+    /// A key given before is not asked for again (see [`KEYS`]).
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
+        if let Some(key) = KEYS.lock().ok().and_then(|keys| keys.get(file)) {
+            return Ok(key);
+        }
         for attempt in 1..=KEY_REQUEST_ATTEMPTS {
             let (tx, rx) = oneshot::channel();
 
@@ -99,7 +140,13 @@ impl AudioKeyManager {
 
             self.send_key_request(seq, track, file)?;
             match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
-                Ok(k) => return k?,
+                Ok(k) => {
+                    let key = k??;
+                    if let Ok(mut keys) = KEYS.lock() {
+                        keys.keep(file, key);
+                    }
+                    return Ok(key);
+                }
                 Err(_) => {
                     // A late answer to this request is dropped by dispatch.
                     self.lock(|inner| inner.pending.remove(&seq));
@@ -121,5 +168,28 @@ impl AudioKeyManager {
         data.write_u16::<BigEndian>(0x0000)?;
 
         self.session().send_packet(PacketType::RequestKey, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_oldest_keys_make_way() {
+        let file = |n: usize| FileId::from_raw(&n.to_be_bytes().repeat(3)[..20]);
+        let mut keys = Keys::default();
+        for n in 0..=KEPT_KEYS {
+            keys.keep(file(n), AudioKey([n as u8; 16]));
+        }
+        assert_eq!(keys.get(file(0)), None);
+        assert_eq!(keys.get(file(1)), Some(AudioKey([1; 16])));
+        assert_eq!(
+            keys.get(file(KEPT_KEYS)),
+            Some(AudioKey([KEPT_KEYS as u8; 16]))
+        );
+        // Kept again, a key keeps its place.
+        keys.keep(file(1), AudioKey([1; 16]));
+        assert_eq!(keys.order.len(), KEPT_KEYS);
     }
 }
