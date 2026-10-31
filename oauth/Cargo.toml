@@ -39,8 +39,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "system-proxy",
 ] }
 thiserror = "2"
-# The device flow's async poll needs a timer to wait between polls.
-tokio = { version = "1", features = ["time"] }
+# The device flow's async poll needs a timer to wait between polls; the
+# async authorization code flow listens for the redirect without blocking.
+tokio = { version = "1", features = ["time", "net", "io-util"] }
 url = "2.5"
 
 [dev-dependencies]

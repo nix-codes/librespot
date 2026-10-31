@@ -259,6 +259,53 @@ fn get_authcode_listener(
     code
 }
 
+/// The same as [`get_authcode_listener`], waiting without blocking a thread:
+/// dropping the future (a timeout, or the task aborted) stops listening and
+/// frees the port.
+async fn get_authcode_listener_async(
+    socket_address: SocketAddr,
+    message: String,
+) -> Result<AuthorizationCode, OAuthError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(socket_address)
+        .await
+        .map_err(|e| OAuthError::AuthCodeListenerBind {
+            addr: socket_address,
+            e,
+        })?;
+    info!("OAuth server listening on {socket_address:?}");
+
+    // The server will terminate itself after collecting the first code.
+    let (mut stream, _) = listener
+        .accept()
+        .await
+        .map_err(|_| OAuthError::AuthCodeListenerTerminated)?;
+    let mut request_line = String::new();
+    tokio::io::BufReader::new(&mut stream)
+        .read_line(&mut request_line)
+        .await
+        .map_err(|_| OAuthError::AuthCodeListenerRead)?;
+
+    let redirect_url = request_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or(OAuthError::AuthCodeListenerParse)?;
+    let code = get_code(&("http://localhost".to_string() + redirect_url));
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{}",
+        message.len(),
+        message
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|_| OAuthError::AuthCodeListenerWrite)?;
+
+    code
+}
+
 // If the specified `redirect_uri` is HTTP and contains a port,
 // then the corresponding socket address is returned.
 fn get_socket_address(redirect_uri: &str) -> Option<SocketAddr> {
@@ -391,11 +438,14 @@ impl OAuthClient {
     }
 
     /// Asyncronously obtain a Spotify access token using the authorization code with PKCE OAuth flow.
+    ///
+    /// Waiting for the browser's redirect blocks no thread: dropping the
+    /// future stops listening, so a sign-in never finished can be given up.
     pub async fn get_access_token_async(&self) -> Result<OAuthToken, OAuthError> {
         let pkce_verifier = self.set_auth_url();
 
         let code = match get_socket_address(&self.redirect_uri) {
-            Some(addr) => get_authcode_listener(addr, self.message.clone()),
+            Some(addr) => get_authcode_listener_async(addr, self.message.clone()).await,
             _ => get_authcode_stdin(),
         }?;
         trace!("Exchange {code:?} for access token");
@@ -821,6 +871,46 @@ mod test {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use super::*;
+
+    /// A free port on the loopback, for a listener of the test's own.
+    fn free_address() -> SocketAddr {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_async_listener_takes_the_code_from_the_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let addr = free_address();
+        let listening = tokio::spawn(get_authcode_listener_async(addr, "done".into()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut browser = tokio::net::TcpStream::connect(addr).await.unwrap();
+        browser
+            .write_all(b"GET /login?code=xyz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut page = String::new();
+        browser.read_to_string(&mut page).await.unwrap();
+        assert!(page.ends_with("done"), "{page}");
+        let code = listening.await.unwrap().unwrap();
+        assert_eq!(code.secret(), "xyz");
+    }
+
+    #[tokio::test]
+    async fn giving_up_the_async_listener_frees_its_port() {
+        let addr = free_address();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(100),
+            get_authcode_listener_async(addr, String::new()),
+        )
+        .await;
+        assert!(waited.is_err(), "no browser came, so it was still waiting");
+        // Listening again, as a second sign-in does, works at once.
+        TcpListener::bind(addr).expect("the port is free again");
+    }
 
     #[test]
     fn the_url_handler_is_given_the_authorization_url() {
