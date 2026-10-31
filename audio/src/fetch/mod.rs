@@ -257,6 +257,8 @@ pub struct StreamingRequest {
     initial_response: Option<Response<Incoming>>,
     offset: usize,
     length: usize,
+    /// The file's seeks when the request was made (`AudioFileShared::seeks`).
+    seeks: usize,
 }
 
 #[derive(Debug)]
@@ -440,6 +442,11 @@ impl StreamLoaderController {
 pub struct AudioFileStreaming {
     read_file: fs::File,
     position: u64,
+    /// A seek to a part not downloaded yet paused streaming: the decoder's
+    /// reads only look for its place, until one follows on from the last.
+    probing: bool,
+    /// Seeked since the last read.
+    seeked: bool,
     stream_loader_command_tx: mpsc::UnboundedSender<StreamLoaderCommand>,
     shared: Arc<AudioFileShared>,
 }
@@ -462,6 +469,11 @@ struct AudioFileShared {
     throughput: AtomicUsize,
     /// A read gave up waiting for the audio to download.
     stalled: AtomicBool,
+    /// Seeks to a part not downloaded yet, counted. A request made before
+    /// the last of them and not started yet is dropped, unless it holds the
+    /// read position: many seeks would otherwise queue downloads of parts
+    /// left behind, ahead of the one playing.
+    seeks: AtomicUsize,
 }
 
 impl AudioFileShared {
@@ -481,6 +493,7 @@ impl AudioFileShared {
             read_position: AtomicUsize::new(0),
             throughput: AtomicUsize::new(0),
             stalled: AtomicBool::new(false),
+            seeks: AtomicUsize::new(0),
         }
     }
 
@@ -675,6 +688,7 @@ impl AudioFileStreaming {
             initial_response: Some(response),
             offset: 0,
             length: upper_bound + 1,
+            seeks: 0,
         };
 
         let shared = Arc::new(AudioFileShared::new(
@@ -727,6 +741,7 @@ impl AudioFileStreaming {
             initial_response: None,
             offset,
             length,
+            seeks: 0,
         };
 
         Self::start(session, shared, initial_request, write_file, complete_tx)
@@ -756,6 +771,8 @@ impl AudioFileStreaming {
         Ok(AudioFileStreaming {
             read_file,
             position: 0,
+            probing: false,
+            seeked: false,
             stream_loader_command_tx,
             shared,
         })
@@ -764,6 +781,14 @@ impl AudioFileStreaming {
 
 impl Read for AudioFileStreaming {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        // A read following on from the last: the decoder found its place
+        // and plays on, so stream again.
+        if self.probing && !self.seeked {
+            self.probing = false;
+            self.shared.set_download_streaming(true);
+        }
+        self.seeked = false;
+
         let offset = self.position as usize;
 
         if offset >= self.shared.file_size {
@@ -862,23 +887,20 @@ impl Seek for AudioFileStreaming {
             .downloaded
             .contains(requested_pos as usize);
 
-        let mut was_streaming = false;
         if !available {
-            // Ensure random access mode if we need to download this part.
-            // Checking whether we are streaming now is a micro-optimization
-            // to save an atomic load.
-            was_streaming = self.shared.is_download_streaming();
-            if was_streaming {
+            self.shared.seeks.fetch_add(1, Ordering::AcqRel);
+            // Random access while the decoder looks for its place: each of
+            // its reads fetches a small block, not seconds ahead, and nothing
+            // is fetched ahead until it plays on (see `read`).
+            if self.shared.is_download_streaming() {
                 self.shared.set_download_streaming(false);
+                self.probing = true;
             }
         }
+        self.seeked = true;
 
         self.position = self.read_file.seek(pos)?;
         self.shared.set_read_position(self.position);
-
-        if !available && was_streaming {
-            self.shared.set_download_streaming(true);
-        }
 
         Ok(self.position)
     }
@@ -906,6 +928,7 @@ impl Seek for AudioFile {
 mod tests {
     use super::*;
     use librespot_core::SessionConfig;
+    use std::time::Instant;
 
     #[tokio::test]
     async fn a_prefetched_head_reads_without_waiting_for_the_cdn() {
@@ -935,6 +958,127 @@ mod tests {
 
         let status = file.shared.download_status.lock().unwrap();
         assert_eq!(status.downloaded.contained_length_from_value(0), data.len());
+    }
+
+    /// A CDN serving byte ranges of a file of `size` bytes at `rate` bytes a
+    /// second, one request at a time per connection; counts the bytes sent.
+    fn slow_cdn(size: usize, rate: usize) -> (String, Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counter = sent.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let sent = counter.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut stream = stream;
+                    loop {
+                        let mut range = None;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let line = line.trim_end();
+                            if line.is_empty() {
+                                break;
+                            }
+                            if let Some(bytes) =
+                                line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                            {
+                                let (start, end) = bytes.split_once('-').unwrap();
+                                range = Some((
+                                    start.parse::<usize>().unwrap(),
+                                    end.parse::<usize>().unwrap(),
+                                ));
+                            }
+                        }
+                        let (start, end) = range.unwrap();
+                        let end = end.min(size - 1);
+                        let body: Vec<u8> = (start..=end).map(|i| (i % 251) as u8).collect();
+                        std::thread::sleep(Duration::from_secs_f64(
+                            body.len() as f64 / rate as f64,
+                        ));
+                        let head = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                        if stream
+                            .write_all(head.as_bytes())
+                            .and_then(|_| stream.write_all(&body))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        sent.fetch_add(body.len(), Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        (url, sent)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn many_seeks_leave_no_downloads_behind() {
+        const SIZE: usize = 24 * 1024 * 1024;
+        let (url, sent) = slow_cdn(SIZE, 1024 * 1024);
+        let session = Session::new(SessionConfig::default(), None);
+        let file_id = FileId::from_raw(&[7; 20]);
+        let data: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let head = AudioFileHead {
+            file_id,
+            cdn_url: CdnUrl::new(file_id),
+            url,
+            file_size: SIZE,
+            data: Bytes::from(data),
+        };
+        let (complete_tx, _complete_rx) = oneshot::channel();
+        let file =
+            AudioFileStreaming::open_after_head(session, complete_tx, 40 * 1024, head).unwrap();
+        file.shared.set_download_streaming(true);
+        let waits = tokio::task::spawn_blocking(move || {
+            let mut file = file;
+            let mut buffer = vec![0; 16 * 1024];
+            let mut waits = Vec::new();
+            // As a decoder seeking: a few probing reads, then playing on.
+            for share in [
+                0.3, 0.8, 0.5, 0.9, 0.2, 0.6, 0.4, 0.7, 0.1, 0.95, 0.35, 0.65,
+            ] {
+                let started = Instant::now();
+                let at = (SIZE as f64 * share) as u64;
+                for probe in [at, at + 100_000, at + 50_000] {
+                    file.seek(SeekFrom::Start(probe)).unwrap();
+                    file.read_exact(&mut buffer[..4096]).unwrap();
+                }
+                for _ in 0..4 {
+                    let n = file.read(&mut buffer).unwrap();
+                    let from = file.position as usize - n;
+                    assert!(
+                        buffer[..n]
+                            .iter()
+                            .enumerate()
+                            .all(|(i, b)| *b == ((from + i) % 251) as u8)
+                    );
+                }
+                waits.push(started.elapsed());
+            }
+            waits
+        })
+        .await
+        .unwrap();
+        // Without dropping the downloads left behind and fetching small
+        // blocks while seeking, the seeks waited 20 s in all and 18.5 MiB was
+        // sent; with them, under 6 s and 3 to 6 MiB.
+        let waited: Duration = waits.iter().sum();
+        assert!(
+            waited < Duration::from_secs(10),
+            "the seeks waited {waited:?}"
+        );
+        let sent = sent.load(Ordering::Relaxed);
+        assert!(sent < 10 * 1024 * 1024, "{} KiB sent", sent / 1024);
     }
 
     #[test]

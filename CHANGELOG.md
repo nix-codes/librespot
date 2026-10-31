@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [audio] Drop the downloads a seek left behind before they start, and fetch small blocks while the decoder looks for its place, so many seeks in a row no longer stall playback behind downloads of parts it left
 - [core] Ask again for an audio key whose answer is late, up to three times, instead of loading the track without decryption after the first timeout
 - [audio] Mark a download's first request as requested by its length rather than its end offset
 - [playback] Stop instead of skipping through the queue when Spotify refuses a track's audio key

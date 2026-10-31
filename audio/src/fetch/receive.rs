@@ -1,7 +1,7 @@
 use std::{
     cmp::{max, min},
     io::{Seek, SeekFrom, Write},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
 
@@ -47,6 +47,24 @@ async fn receive_data(
     let mut actual_length = 0;
 
     let permit = shared.download_slots.acquire().await?;
+
+    // Seeked away while it waited for the slot: the part isn't needed now.
+    let range = Range::new(request.offset, request.length);
+    if request.initial_response.is_none()
+        && request.seeks != shared.seeks.load(Ordering::Acquire)
+        && !(range.start..range.end()).contains(&shared.read_position())
+    {
+        let mut download_status = shared
+            .download_status
+            .lock()
+            .expect(DOWNLOAD_STATUS_POISON_MSG);
+        download_status.requested.subtract_range(&range);
+        shared.cond.notify_all();
+        drop(download_status);
+        drop(permit);
+        let _ = file_data_tx.send(ReceivedData::SlotFree);
+        return Ok(());
+    }
 
     let request_time = Instant::now();
     let mut measure_ping_time = true;
@@ -234,6 +252,7 @@ impl AudioFileFetch {
                 initial_response: None,
                 offset: range.start,
                 length: range.length,
+                seeks: self.shared.seeks.load(Ordering::Acquire),
             };
 
             self.session.spawn(receive_data(

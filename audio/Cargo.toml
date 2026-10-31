@@ -32,5 +32,8 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "sync"] }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
 [lints]
 workspace = true
