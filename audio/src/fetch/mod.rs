@@ -148,7 +148,8 @@ pub enum AudioFile {
 pub struct AudioFileHead {
     file_id: FileId,
     cdn_url: CdnUrl,
-    url: String,
+    /// The servers offering the file, the one the head came from first.
+    urls: Vec<String>,
     file_size: usize,
     data: Bytes,
 }
@@ -169,12 +170,12 @@ impl AudioFileHead {
         let cdn_url = CdnUrl::new(file_id).resolve_audio(session).await?;
         let urls = cdn_url.try_get_urls()?;
         let mut last_error = None;
-        for url in &urls {
+        for (index, url) in urls.iter().enumerate() {
             match Self::fetch_from(session, url, length).await {
                 Ok((file_size, data)) => {
                     return Ok(Self {
                         file_id,
-                        url: url.to_string(),
+                        urls: from_server(&urls, index),
                         cdn_url: cdn_url.clone(),
                         file_size,
                         data,
@@ -232,7 +233,7 @@ impl AudioFileHead {
     pub fn is_fresh(&self) -> bool {
         self.cdn_url
             .try_get_urls()
-            .is_ok_and(|urls| urls.contains(&self.url.as_str()))
+            .is_ok_and(|urls| urls.contains(&self.urls[0].as_str()))
     }
 }
 
@@ -253,7 +254,10 @@ fn content_range(response: &Response<Incoming>) -> Result<(usize, usize), Error>
 
 #[derive(Debug)]
 pub struct StreamingRequest {
-    streamer: IntoStream<ResponseFuture>,
+    /// The request as made for the server at `server`, if not answered yet.
+    /// Waiting for its slot, it may find that another has taken over since.
+    streamer: Option<IntoStream<ResponseFuture>>,
+    server: usize,
     initial_response: Option<Response<Incoming>>,
     offset: usize,
     length: usize,
@@ -457,7 +461,10 @@ struct AudioFileDownloadStatus {
 }
 
 struct AudioFileShared {
-    cdn_url: String,
+    /// The servers offering the file. They are tried in turn from
+    /// `cdn_url_index`, which stays on the last that answered.
+    cdn_urls: Vec<String>,
+    cdn_url_index: AtomicUsize,
     file_size: usize,
     bytes_per_second: usize,
     cond: Condvar,
@@ -477,9 +484,10 @@ struct AudioFileShared {
 }
 
 impl AudioFileShared {
-    fn new(cdn_url: String, file_size: usize, bytes_per_second: usize) -> Self {
+    fn new(cdn_urls: Vec<String>, file_size: usize, bytes_per_second: usize) -> Self {
         Self {
-            cdn_url,
+            cdn_urls,
+            cdn_url_index: AtomicUsize::new(0),
             file_size,
             bytes_per_second,
             cond: Condvar::new(),
@@ -495,6 +503,20 @@ impl AudioFileShared {
             stalled: AtomicBool::new(false),
             seeks: AtomicUsize::new(0),
         }
+    }
+
+    /// The server to ask now, with its place among them.
+    fn cdn_url(&self) -> (usize, &str) {
+        let index = self.cdn_url_index.load(Ordering::Acquire);
+        (index, &self.cdn_urls[index])
+    }
+
+    /// Moves on from the server at `index`, unless that was already done.
+    fn next_cdn_url(&self, index: usize) {
+        let next = (index + 1) % self.cdn_urls.len();
+        let _ =
+            self.cdn_url_index
+                .compare_exchange(index, next, Ordering::AcqRel, Ordering::Acquire);
     }
 
     fn is_download_streaming(&self) -> bool {
@@ -535,6 +557,13 @@ impl AudioFileShared {
         self.read_position
             .store(position as usize, Ordering::Release)
     }
+}
+
+/// The servers in the order to try them, starting with the one at `index`.
+fn from_server(urls: &[&str], index: usize) -> Vec<String> {
+    let mut urls: Vec<String> = urls.iter().map(ToString::to_string).collect();
+    urls.rotate_left(index);
+    urls
 }
 
 impl AudioFile {
@@ -640,7 +669,7 @@ impl AudioFileStreaming {
 
         let mut response_streamer_url = None;
         let urls = cdn_url.try_get_urls()?;
-        for url in &urls {
+        for (index, url) in urls.iter().enumerate() {
             // When the audio file is really small, this `download_size` may turn out to be
             // larger than the audio file we're going to stream later on. This is OK; requesting
             // `Content-Range` > `Content-Length` will return the complete file with status code
@@ -661,7 +690,7 @@ impl AudioFileStreaming {
 
             match streamer_result {
                 Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
-                    response_streamer_url = Some((r, streamer, url));
+                    response_streamer_url = Some((r, index));
                     break;
                 }
                 Ok(r) => warn!(
@@ -672,19 +701,20 @@ impl AudioFileStreaming {
             }
         }
 
-        let Some((response, streamer, url)) = response_streamer_url else {
+        let Some((response, index)) = response_streamer_url else {
             return Err(Error::unavailable(format!(
                 "{} URLs failed, none left to try",
                 urls.len()
             )));
         };
 
-        trace!("Streaming from {url}");
+        trace!("Streaming from {}", urls[index]);
 
         let (upper_bound, file_size) = content_range(&response)?;
 
         let initial_request = StreamingRequest {
-            streamer,
+            streamer: None,
+            server: 0,
             initial_response: Some(response),
             offset: 0,
             length: upper_bound + 1,
@@ -692,7 +722,7 @@ impl AudioFileStreaming {
         };
 
         let shared = Arc::new(AudioFileShared::new(
-            url.to_string(),
+            from_server(&urls, index),
             file_size,
             bytes_per_second,
         ));
@@ -712,12 +742,12 @@ impl AudioFileStreaming {
         head: AudioFileHead,
     ) -> Result<AudioFileStreaming, Error> {
         let AudioFileHead {
-            url,
+            urls,
             file_size,
             data,
             ..
         } = head;
-        let shared = Arc::new(AudioFileShared::new(url, file_size, bytes_per_second));
+        let shared = Arc::new(AudioFileShared::new(urls, file_size, bytes_per_second));
 
         let mut write_file = NamedTempFile::new_in(session.config().tmp_dir.clone())?;
         write_file.as_file().set_len(file_size as u64)?;
@@ -734,10 +764,10 @@ impl AudioFileStreaming {
             AudioFetchParams::get().minimum_download_size,
             file_size - offset,
         );
+        let (server, url) = shared.cdn_url();
         let initial_request = StreamingRequest {
-            streamer: session
-                .spclient()
-                .stream_from_cdn(&shared.cdn_url, offset, length)?,
+            streamer: Some(session.spclient().stream_from_cdn(url, offset, length)?),
+            server,
             initial_response: None,
             offset,
             length,
@@ -926,6 +956,7 @@ impl Seek for AudioFile {
 
 #[cfg(test)]
 mod tests {
+    use super::receive::SERVER_STALL_LIMIT;
     use super::*;
     use librespot_core::SessionConfig;
     use std::time::Instant;
@@ -939,7 +970,7 @@ mod tests {
             file_id,
             cdn_url: CdnUrl::new(file_id),
             // Nothing listens here, so the rest of the file never arrives.
-            url: "http://127.0.0.1:9/audio".into(),
+            urls: vec!["http://127.0.0.1:9/audio".into()],
             file_size: 256 * 1024,
             data: Bytes::from(data.clone()),
         };
@@ -1031,7 +1062,7 @@ mod tests {
         let head = AudioFileHead {
             file_id,
             cdn_url: CdnUrl::new(file_id),
-            url,
+            urls: vec![url],
             file_size: SIZE,
             data: Bytes::from(data),
         };
@@ -1081,13 +1112,172 @@ mod tests {
         assert!(sent < 10 * 1024 * 1024, "{} KiB sent", sent / 1024);
     }
 
+    /// How a server that gives out behaves when asked for a part.
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// Takes the request and never answers.
+        Silent,
+        /// Sends this much of the part, then nothing more.
+        StopsAfter(usize),
+        /// Closes the connection.
+        Closes,
+    }
+
+    /// A server that gives out on every request.
+    fn faulty_cdn(size: usize, fault: Fault) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut range = (0, 0);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let line = line.trim_end().to_ascii_lowercase();
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some(bytes) = line.strip_prefix("range: bytes=") {
+                            let (start, end) = bytes.split_once('-').unwrap();
+                            range = (
+                                start.parse::<usize>().unwrap(),
+                                end.parse::<usize>().unwrap().min(size - 1),
+                            );
+                        }
+                    }
+                    let (start, end) = range;
+                    match fault {
+                        Fault::Closes => return,
+                        Fault::Silent => {}
+                        Fault::StopsAfter(bytes) => {
+                            let body: Vec<u8> =
+                                (start..start + bytes).map(|i| (i % 251) as u8).collect();
+                            let head = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}\r\nContent-Length: {}\r\n\r\n",
+                                end + 1 - start
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(&body);
+                            let _ = stream.flush();
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(600));
+                });
+            }
+        });
+        url
+    }
+
+    /// A file of 512 KiB whose head is held, the rest to come from `urls`.
+    fn file_from(urls: Vec<String>) -> AudioFileStreaming {
+        let file_id = FileId::from_raw(&[7; 20]);
+        let head = AudioFileHead {
+            file_id,
+            cdn_url: CdnUrl::new(file_id),
+            urls,
+            file_size: FAULTS_FILE_SIZE,
+            data: Bytes::from((0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>()),
+        };
+        let session = Session::new(SessionConfig::default(), None);
+        let (complete_tx, _complete_rx) = oneshot::channel();
+        // Left to run: the file's download ends with this end of the channel.
+        std::mem::forget(_complete_rx);
+        AudioFileStreaming::open_after_head(session, complete_tx, 40 * 1024, head).unwrap()
+    }
+
+    const FAULTS_FILE_SIZE: usize = 512 * 1024;
+
+    /// Reads from `at` to the end of the file, checking every byte.
+    fn read_to_end_from(file: &mut AudioFileStreaming, at: u64) -> Duration {
+        let started = Instant::now();
+        file.seek(SeekFrom::Start(at)).unwrap();
+        let mut buffer = vec![0; 16 * 1024];
+        loop {
+            let from = file.position as usize;
+            let n = file.read(&mut buffer).unwrap();
+            if n == 0 {
+                return started.elapsed();
+            }
+            assert!(
+                buffer[..n]
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| *b == ((from + i) % 251) as u8),
+                "wrong bytes at {from}"
+            );
+        }
+    }
+
+    async fn plays_on_the_next_server_after(fault: Fault) -> Duration {
+        let (good, _) = slow_cdn(FAULTS_FILE_SIZE, 64 * 1024 * 1024);
+        let bad = faulty_cdn(FAULTS_FILE_SIZE, fault);
+        let mut file = file_from(vec![bad, good.clone()]);
+        tokio::task::spawn_blocking(move || {
+            let waited = read_to_end_from(&mut file, 64 * 1024);
+            assert!(!file.shared.stalled.load(Ordering::Acquire));
+            assert_eq!(file.shared.cdn_url().1, good);
+            waited
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_never_answers_gives_way_to_the_next() {
+        let waited = plays_on_the_next_server_after(Fault::Silent).await;
+        assert!(waited >= SERVER_STALL_LIMIT, "waited {waited:?}");
+        // Only the first part waits: it stays on the server that answered.
+        assert!(
+            waited < SERVER_STALL_LIMIT + Duration::from_secs(2),
+            "waited {waited:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_stops_midway_leaves_the_rest_to_the_next() {
+        let waited = plays_on_the_next_server_after(Fault::StopsAfter(20_000)).await;
+        assert!(
+            waited < SERVER_STALL_LIMIT + Duration::from_secs(2),
+            "waited {waited:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_closes_the_connection_gives_way_at_once() {
+        let waited = plays_on_the_next_server_after(Fault::Closes).await;
+        assert!(waited < SERVER_STALL_LIMIT, "waited {waited:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_every_server_silent_the_read_stalls() {
+        let urls = vec![
+            faulty_cdn(FAULTS_FILE_SIZE, Fault::Silent),
+            faulty_cdn(FAULTS_FILE_SIZE, Fault::Silent),
+        ];
+        let mut file = file_from(urls);
+        tokio::task::spawn_blocking(move || {
+            file.seek(SeekFrom::Start(64 * 1024)).unwrap();
+            let error = file.read(&mut [0; 1024]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(file.shared.stalled.load(Ordering::Acquire));
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn an_unresolved_head_is_not_fresh() {
         let file_id = FileId::from_raw(&[7; 20]);
         let head = AudioFileHead {
             file_id,
             cdn_url: CdnUrl::new(file_id),
-            url: "https://audio.example/file".into(),
+            urls: vec!["https://audio.example/file".into()],
             file_size: 2,
             data: Bytes::from_static(b"x"),
         };

@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use hyper::StatusCode;
@@ -38,14 +38,135 @@ enum ReceivedData {
 const ONE_SECOND: Duration = Duration::from_secs(1);
 const DOWNLOAD_STATUS_POISON_MSG: &str = "audio download status mutex should not be poisoned";
 
+/// How long a server may send nothing before what's left of a part is asked
+/// of the next. A server can answer for one part of a file and never for
+/// another while the others have it all. All of them are given their turn
+/// well before a read gives up (`AudioFetchParams::download_timeout`, 8 s),
+/// so that a stuck server isn't taken for a lost connection.
+pub(super) const SERVER_STALL_LIMIT: Duration = Duration::from_secs(3);
+
+/// Waits for `future`, up to `limit`, and no longer than the file is wanted.
+async fn wait_for<F: Future>(
+    file_data_tx: &mpsc::UnboundedSender<ReceivedData>,
+    limit: Option<Duration>,
+    future: F,
+) -> Result<F::Output, Error> {
+    let expired = async {
+        match limit {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        output = future => Ok(output),
+        _ = file_data_tx.closed() => Err(AudioFileError::Channel.into()),
+        _ = expired => Err(AudioFileError::WaitTimeout.into()),
+    }
+}
+
+/// What has come of a request so far, across the servers asked.
+struct Progress {
+    offset: usize,
+    length: usize,
+    measure_ping_time: bool,
+    started: Instant,
+}
+
+/// Asks one server for what's left of the request.
+async fn receive_from_server(
+    session: &Session,
+    shared: &AudioFileShared,
+    file_data_tx: &mpsc::UnboundedSender<ReceivedData>,
+    request: &mut StreamingRequest,
+    progress: &mut Progress,
+    limit: Option<Duration>,
+) -> AudioFileResult {
+    let response = match request.initial_response.take() {
+        // the request was already made outside of this function
+        Some(response) => response,
+        None => {
+            let (server, url) = shared.cdn_url();
+            let mut streamer = match request.streamer.take() {
+                Some(streamer) if request.server == server => streamer,
+                _ => session.spclient().stream_from_cdn(
+                    url,
+                    progress.offset,
+                    request.length - progress.length,
+                )?,
+            };
+            wait_for(file_data_tx, limit, streamer.next())
+                .await?
+                .ok_or(AudioFileError::NoData)??
+        }
+    };
+
+    if progress.measure_ping_time {
+        let duration = Instant::now().duration_since(progress.started);
+        // may be zero if we are handling an initial response
+        if duration.as_millis() > 0 {
+            file_data_tx.send(ReceivedData::ResponseTime(duration))?;
+            progress.measure_ping_time = false;
+        }
+    }
+
+    let code = response.status();
+    if code != StatusCode::PARTIAL_CONTENT {
+        if code == StatusCode::TOO_MANY_REQUESTS {
+            if let Some(duration) = HttpClient::get_retry_after(response.headers()) {
+                warn!(
+                    "Rate limiting, retrying in {} seconds...",
+                    duration.as_secs()
+                );
+                // sleeping here means we hold onto this streamer "slot"
+                // (we don't decrease the number of open requests)
+                tokio::time::sleep(duration).await;
+            }
+        }
+
+        return Err(AudioFileError::StatusCode(code).into());
+    }
+
+    // A server giving out may leave a piece of the part, which the next then
+    // need not send again.
+    let mut body = response.into_body();
+    let mut received = BytesMut::new();
+    let outcome = loop {
+        match wait_for(file_data_tx, limit, body.frame()).await {
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    received.extend_from_slice(&data);
+                }
+            }
+            Ok(Some(Err(e))) => break Err(e.into()),
+            Ok(None) => break Ok(()),
+            Err(e) => break Err(e),
+        }
+    };
+    if !received.is_empty() {
+        let data_size = received.len();
+        file_data_tx.send(ReceivedData::Data(PartialFileData {
+            offset: progress.offset,
+            data: received.freeze(),
+        }))?;
+        progress.length += data_size;
+        progress.offset += data_size;
+    }
+    outcome?;
+
+    if progress.length != request.length {
+        let msg = format!("did not expect body to contain {} bytes", progress.length);
+        return Err(Error::data_loss(msg));
+    }
+
+    Ok(())
+}
+
 async fn receive_data(
+    session: Session,
     shared: Arc<AudioFileShared>,
     file_data_tx: mpsc::UnboundedSender<ReceivedData>,
     mut request: StreamingRequest,
 ) -> AudioFileResult {
-    let mut offset = request.offset;
-    let mut actual_length = 0;
-
     let permit = shared.download_slots.acquire().await?;
 
     // Seeked away while it waited for the slot: the part isn't needed now.
@@ -67,76 +188,50 @@ async fn receive_data(
     }
 
     let request_time = Instant::now();
-    let mut measure_ping_time = true;
-    let mut measure_throughput = true;
-
-    let result: Result<_, Error> = loop {
-        let response = match request.initial_response.take() {
-            Some(data) => {
-                // the request was already made outside of this function
-                measure_ping_time = false;
-                measure_throughput = false;
-
-                data
-            }
-            None => match request.streamer.next().await {
-                Some(Ok(response)) => response,
-                Some(Err(e)) => break Err(e.into()),
-                None => {
-                    if actual_length != request.length {
-                        let msg = format!("did not expect body to contain {actual_length} bytes");
-                        break Err(Error::data_loss(msg));
-                    }
-
-                    break Ok(());
-                }
-            },
-        };
-
-        if measure_ping_time {
-            let duration = Instant::now().duration_since(request_time);
-            // may be zero if we are handling an initial response
-            if duration.as_millis() > 0 {
-                file_data_tx.send(ReceivedData::ResponseTime(duration))?;
-                measure_ping_time = false;
-            }
-        }
-
-        let code = response.status();
-        if code != StatusCode::PARTIAL_CONTENT {
-            if code == StatusCode::TOO_MANY_REQUESTS {
-                if let Some(duration) = HttpClient::get_retry_after(response.headers()) {
-                    warn!(
-                        "Rate limiting, retrying in {} seconds...",
-                        duration.as_secs()
-                    );
-                    // sleeping here means we hold onto this streamer "slot"
-                    // (we don't decrease the number of open requests)
-                    tokio::time::sleep(duration).await;
-                }
-            }
-
-            break Err(AudioFileError::StatusCode(code).into());
-        }
-
-        let body = response.into_body();
-        let data = match body
-            .collect()
-            .await
-            .map(http_body_util::Collected::to_bytes)
-        {
-            Ok(bytes) => bytes,
-            Err(e) => break Err(e.into()),
-        };
-
-        let data_size = data.len();
-        file_data_tx.send(ReceivedData::Data(PartialFileData { offset, data }))?;
-
-        actual_length += data_size;
-        offset += data_size;
+    let mut measure_throughput = request.initial_response.is_none();
+    let mut progress = Progress {
+        offset: request.offset,
+        length: 0,
+        measure_ping_time: measure_throughput,
+        started: request_time,
     };
 
-    drop(request.streamer);
+    // The last server asked has no limit: with nowhere else to go, it is
+    // waited for, until the read gives up.
+    let mut servers_left = shared.cdn_urls.len() - 1;
+    let result: Result<_, Error> = loop {
+        let (index, url) = shared.cdn_url();
+        let limit = (servers_left > 0).then_some(SERVER_STALL_LIMIT);
+        let attempt = receive_from_server(
+            &session,
+            &shared,
+            &file_data_tx,
+            &mut request,
+            &mut progress,
+            limit,
+        )
+        .await;
+        match attempt {
+            Ok(()) => break Ok(()),
+            Err(e) if servers_left == 0 || file_data_tx.is_closed() => break Err(e),
+            Err(e) => {
+                // The URL's query holds a token; its host says enough.
+                let host = url.split('/').nth(2).unwrap_or_default();
+                warn!(
+                    "{host} didn't give range {} +{}: {e}; asking the next server",
+                    progress.offset,
+                    request.length - progress.length,
+                );
+                shared.next_cdn_url(index);
+                servers_left -= 1;
+                // The time spent on this one would say nothing of the next.
+                measure_throughput = false;
+                progress.measure_ping_time = false;
+            }
+        }
+    };
+
+    let (offset, actual_length) = (progress.offset, progress.length);
 
     if measure_throughput {
         let duration = Instant::now().duration_since(request_time).as_millis();
@@ -171,10 +266,13 @@ async fn receive_data(
     }
 
     if let Err(e) = result {
-        error!(
-            "Streamer error requesting range {} +{}: {:?}",
-            request.offset, request.length, e
-        );
+        // Stopped because the file was closed: that's no error.
+        if !file_data_tx.is_closed() {
+            error!(
+                "Streamer error requesting range {} +{}: {:?}",
+                request.offset, request.length, e
+            );
+        }
         return Err(e);
     }
 
@@ -239,16 +337,17 @@ impl AudioFileFetch {
         // TODO : refresh cdn_url when the token expired
 
         for range in ranges_to_request.iter() {
-            let streamer = self.session.spclient().stream_from_cdn(
-                &self.shared.cdn_url,
-                range.start,
-                range.length,
-            )?;
+            let (server, url) = self.shared.cdn_url();
+            let streamer =
+                self.session
+                    .spclient()
+                    .stream_from_cdn(url, range.start, range.length)?;
 
             download_status.requested.add_range(range);
 
             let streaming_request = StreamingRequest {
-                streamer,
+                streamer: Some(streamer),
+                server,
                 initial_response: None,
                 offset: range.start,
                 length: range.length,
@@ -256,6 +355,7 @@ impl AudioFileFetch {
             };
 
             self.session.spawn(receive_data(
+                self.session.clone(),
                 self.shared.clone(),
                 self.file_data_tx.clone(),
                 streaming_request,
@@ -472,6 +572,7 @@ pub(super) async fn audio_file_fetch(
     }
 
     session.spawn(receive_data(
+        session.clone(),
         shared.clone(),
         file_data_tx.clone(),
         initial_request,
