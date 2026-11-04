@@ -168,7 +168,7 @@ impl AudioFileHead {
     /// Resolves the file's CDN URL and fetches its first `length` bytes.
     pub async fn fetch(session: &Session, file_id: FileId, length: usize) -> Result<Self, Error> {
         let cdn_url = CdnUrl::new(file_id).resolve_audio(session).await?;
-        let urls = cdn_url.try_get_urls()?;
+        let urls = servers_in_order(session, cdn_url.try_get_urls()?);
         let mut last_error = None;
         for (index, url) in urls.iter().enumerate() {
             match Self::fetch_from(session, url, length).await {
@@ -182,7 +182,11 @@ impl AudioFileHead {
                     });
                 }
                 Err(e) => {
-                    warn!("Fetching the head of {file_id} from {url} failed with error {e:?}");
+                    warn!(
+                        "Fetching the head of {file_id} from {} failed with error {e:?}",
+                        host(url)
+                    );
+                    session.cdn_host_gave_out(host(url));
                     last_error = Some(e);
                 }
             }
@@ -204,10 +208,9 @@ impl AudioFileHead {
             return Err(AudioFileError::StatusCode(response.status()).into());
         }
         let (_, file_size) = content_range(&response)?;
-        let data = response
-            .into_body()
-            .collect()
+        let data = tokio::time::timeout(Duration::from_secs(10), response.into_body().collect())
             .await
+            .map_err(|_| Error::from(AudioFileError::WaitTimeout))?
             .map(http_body_util::Collected::to_bytes)?;
         if data.is_empty() || data.len() > file_size {
             return Err(AudioFileError::NoData.into());
@@ -559,6 +562,17 @@ impl AudioFileShared {
     }
 }
 
+/// The host of a server's URL; the rest holds a token, so it isn't logged.
+fn host(url: &str) -> &str {
+    url.split('/').nth(2).unwrap_or_default()
+}
+
+/// The servers with those that gave out on this session last.
+fn servers_in_order<U: AsRef<str>>(session: &Session, mut urls: Vec<U>) -> Vec<U> {
+    urls.sort_by_key(|url| session.cdn_host_has_given_out(host(url.as_ref())));
+    urls
+}
+
 /// The servers in the order to try them, starting with the one at `index`.
 fn from_server(urls: &[&str], index: usize) -> Vec<String> {
     let mut urls: Vec<String> = urls.iter().map(ToString::to_string).collect();
@@ -668,7 +682,7 @@ impl AudioFileStreaming {
         let minimum_download_size = AudioFetchParams::get().minimum_download_size;
 
         let mut response_streamer_url = None;
-        let urls = cdn_url.try_get_urls()?;
+        let urls = servers_in_order(&session, cdn_url.try_get_urls()?);
         for (index, url) in urls.iter().enumerate() {
             // When the audio file is really small, this `download_size` may turn out to be
             // larger than the audio file we're going to stream later on. This is OK; requesting
@@ -694,10 +708,17 @@ impl AudioFileStreaming {
                     break;
                 }
                 Ok(r) => warn!(
-                    "Fetching {url} returned {} (expected 206 Partial Content), trying next",
+                    "Fetching {} returned {} (expected 206 Partial Content), trying next",
+                    host(url),
                     r.status()
                 ),
-                Err(e) => warn!("Fetching {url} failed with error {e:?}, trying next"),
+                Err(e) => {
+                    warn!(
+                        "Fetching {} failed with error {e:?}, trying next",
+                        host(url)
+                    );
+                    session.cdn_host_gave_out(host(url));
+                }
             }
         }
 
@@ -747,7 +768,11 @@ impl AudioFileStreaming {
             data,
             ..
         } = head;
-        let shared = Arc::new(AudioFileShared::new(urls, file_size, bytes_per_second));
+        let shared = Arc::new(AudioFileShared::new(
+            servers_in_order(&session, urls),
+            file_size,
+            bytes_per_second,
+        ));
 
         let mut write_file = NamedTempFile::new_in(session.config().tmp_dir.clone())?;
         write_file.as_file().set_len(file_size as u64)?;
@@ -1121,6 +1146,8 @@ mod tests {
         StopsAfter(usize),
         /// Closes the connection.
         Closes,
+        /// Sends the part, far too slowly to play.
+        Trickles,
     }
 
     /// A server that gives out on every request.
@@ -1154,6 +1181,23 @@ mod tests {
                     let (start, end) = range;
                     match fault {
                         Fault::Closes => return,
+                        Fault::Trickles => {
+                            let head = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{size}\r\nContent-Length: {}\r\n\r\n",
+                                end + 1 - start
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            // 5 KiB/s, always within the time a server may
+                            // send nothing.
+                            for chunk in (start..=end).collect::<Vec<_>>().chunks(1024) {
+                                let body: Vec<u8> = chunk.iter().map(|i| (i % 251) as u8).collect();
+                                if stream.write_all(&body).is_err() {
+                                    return;
+                                }
+                                let _ = stream.flush();
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                        }
                         Fault::Silent => {}
                         Fault::StopsAfter(bytes) => {
                             let body: Vec<u8> =
@@ -1176,6 +1220,10 @@ mod tests {
 
     /// A file of 512 KiB whose head is held, the rest to come from `urls`.
     fn file_from(urls: Vec<String>) -> AudioFileStreaming {
+        file_on(Session::new(SessionConfig::default(), None), urls)
+    }
+
+    fn file_on(session: Session, urls: Vec<String>) -> AudioFileStreaming {
         let file_id = FileId::from_raw(&[7; 20]);
         let head = AudioFileHead {
             file_id,
@@ -1184,7 +1232,6 @@ mod tests {
             file_size: FAULTS_FILE_SIZE,
             data: Bytes::from((0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>()),
         };
-        let session = Session::new(SessionConfig::default(), None);
         let (complete_tx, _complete_rx) = oneshot::channel();
         // Left to run: the file's download ends with this end of the channel.
         std::mem::forget(_complete_rx);
@@ -1252,6 +1299,36 @@ mod tests {
     async fn a_server_that_closes_the_connection_gives_way_at_once() {
         let waited = plays_on_the_next_server_after(Fault::Closes).await;
         assert!(waited < SERVER_STALL_LIMIT, "waited {waited:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_too_slow_to_play_gives_way_to_the_next() {
+        let waited = plays_on_the_next_server_after(Fault::Trickles).await;
+        assert!(waited >= SERVER_STALL_LIMIT, "waited {waited:?}");
+        // Sooner than a read gives up, though data keeps coming.
+        assert!(waited < Duration::from_secs(7), "waited {waited:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_gave_out_is_asked_last_for_the_next_file() {
+        let (good, _) = slow_cdn(FAULTS_FILE_SIZE, 64 * 1024 * 1024);
+        let bad = faulty_cdn(FAULTS_FILE_SIZE, Fault::Silent);
+        let session = Session::new(SessionConfig::default(), None);
+        let urls = vec![bad, good.clone()];
+        let mut first = file_on(session.clone(), urls.clone());
+        let second_session = session.clone();
+        let waited = tokio::task::spawn_blocking(move || {
+            assert!(read_to_end_from(&mut first, 64 * 1024) >= SERVER_STALL_LIMIT);
+            let mut second = file_on(second_session, urls);
+            assert_eq!(second.shared.cdn_url().1, good);
+            read_to_end_from(&mut second, 64 * 1024)
+        })
+        .await
+        .unwrap();
+        assert!(waited < SERVER_STALL_LIMIT, "waited {waited:?}");
+
+        // A new session gives it another chance.
+        assert!(!Session::new(SessionConfig::default(), None).cdn_host_has_given_out("127.0.0.1"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

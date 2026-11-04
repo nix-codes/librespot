@@ -18,7 +18,7 @@ use crate::range_set::{Range, RangeSet};
 
 use super::{
     AudioFetchParams, AudioFileError, AudioFileResult, AudioFileShared, StreamLoaderCommand,
-    StreamingRequest,
+    StreamingRequest, host,
 };
 
 struct PartialFileData {
@@ -42,7 +42,9 @@ const DOWNLOAD_STATUS_POISON_MSG: &str = "audio download status mutex should not
 /// of the next. A server can answer for one part of a file and never for
 /// another while the others have it all. All of them are given their turn
 /// well before a read gives up (`AudioFetchParams::download_timeout`, 8 s),
-/// so that a stuck server isn't taken for a lost connection.
+/// so that a stuck server isn't taken for a lost connection. It is also the
+/// slack given to a server sending a part, beyond the time the part takes to
+/// play: one that keeps sending, too slowly to keep up, is no better.
 pub(super) const SERVER_STALL_LIMIT: Duration = Duration::from_secs(3);
 
 /// Waits for `future`, up to `limit`, and no longer than the file is wanted.
@@ -81,6 +83,13 @@ async fn receive_from_server(
     progress: &mut Progress,
     limit: Option<Duration>,
 ) -> AudioFileResult {
+    let deadline = Instant::now()
+        + limit.unwrap_or_default()
+        + Duration::from_secs_f64(
+            (request.length - progress.length) as f64 / shared.bytes_per_second as f64,
+        );
+    let limit_now =
+        || limit.map(|stall| stall.min(deadline.saturating_duration_since(Instant::now())));
     let response = match request.initial_response.take() {
         // the request was already made outside of this function
         Some(response) => response,
@@ -94,7 +103,7 @@ async fn receive_from_server(
                     request.length - progress.length,
                 )?,
             };
-            wait_for(file_data_tx, limit, streamer.next())
+            wait_for(file_data_tx, limit_now(), streamer.next())
                 .await?
                 .ok_or(AudioFileError::NoData)??
         }
@@ -131,7 +140,7 @@ async fn receive_from_server(
     let mut body = response.into_body();
     let mut received = BytesMut::new();
     let outcome = loop {
-        match wait_for(file_data_tx, limit, body.frame()).await {
+        match wait_for(file_data_tx, limit_now(), body.frame()).await {
             Ok(Some(Ok(frame))) => {
                 if let Ok(data) = frame.into_data() {
                     received.extend_from_slice(&data);
@@ -215,13 +224,13 @@ async fn receive_data(
             Ok(()) => break Ok(()),
             Err(e) if servers_left == 0 || file_data_tx.is_closed() => break Err(e),
             Err(e) => {
-                // The URL's query holds a token; its host says enough.
-                let host = url.split('/').nth(2).unwrap_or_default();
+                let host = host(url);
                 warn!(
-                    "{host} didn't give range {} +{}: {e}; asking the next server",
+                    "{host} didn't give range {} +{}: {e}; asking the next server, and it goes last from now on",
                     progress.offset,
                     request.length - progress.length,
                 );
+                session.cdn_host_gave_out(host);
                 shared.next_cdn_url(index);
                 servers_left -= 1;
                 // The time spent on this one would say nothing of the next.

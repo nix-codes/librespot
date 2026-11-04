@@ -95,6 +95,8 @@ struct SessionData {
     time_delta: i64,
     invalid: bool,
     user_data: UserData,
+    /// The CDN hosts that gave out on a download.
+    cdn_hosts_given_out: Vec<String>,
 }
 
 struct SessionInternal {
@@ -398,6 +400,25 @@ impl Session {
             .expect(SESSION_DATA_POISON_MSG)
             .user_data
             .clone()
+    }
+
+    /// Notes that a CDN host stopped sending, or sent too slowly. For the rest
+    /// of this session it is asked only after the others.
+    pub fn cdn_host_gave_out(&self, host: &str) {
+        let mut data = self.0.data.write().expect(SESSION_DATA_POISON_MSG);
+        if !data.cdn_hosts_given_out.iter().any(|known| known == host) {
+            data.cdn_hosts_given_out.push(host.to_owned());
+        }
+    }
+
+    pub fn cdn_host_has_given_out(&self, host: &str) -> bool {
+        self.0
+            .data
+            .read()
+            .expect(SESSION_DATA_POISON_MSG)
+            .cdn_hosts_given_out
+            .iter()
+            .any(|known| known == host)
     }
 
     pub fn session_id(&self) -> String {
