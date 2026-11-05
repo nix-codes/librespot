@@ -1287,7 +1287,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_server_that_stops_midway_leaves_the_rest_to_the_next() {
+    async fn a_server_that_stops_midway_gives_way_to_the_next() {
         let waited = plays_on_the_next_server_after(Fault::StopsAfter(20_000)).await;
         assert!(
             waited < SERVER_STALL_LIMIT + Duration::from_secs(2),

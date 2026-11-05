@@ -135,32 +135,27 @@ async fn receive_from_server(
         return Err(AudioFileError::StatusCode(code).into());
     }
 
-    // A server giving out may leave a piece of the part, which the next then
-    // need not send again.
-    let mut body = response.into_body();
-    let mut received = BytesMut::new();
-    let outcome = loop {
-        match wait_for(file_data_tx, limit_now(), body.frame()).await {
-            Ok(Some(Ok(frame))) => {
-                if let Ok(data) = frame.into_data() {
-                    received.extend_from_slice(&data);
-                }
+    // Passed on only whole. A piece of the part would let a read go on, and
+    // the next read's failure would be lost in the decoder's search for the
+    // file's end, which tries lower down, waiting each time, instead of
+    // failing. The next server is asked for the whole part again.
+    let data = {
+        let mut body = response.into_body();
+        let mut received = BytesMut::new();
+        while let Some(frame) = wait_for(file_data_tx, limit_now(), body.frame()).await? {
+            if let Ok(data) = frame?.into_data() {
+                received.extend_from_slice(&data);
             }
-            Ok(Some(Err(e))) => break Err(e.into()),
-            Ok(None) => break Ok(()),
-            Err(e) => break Err(e),
         }
+        received.freeze()
     };
-    if !received.is_empty() {
-        let data_size = received.len();
-        file_data_tx.send(ReceivedData::Data(PartialFileData {
-            offset: progress.offset,
-            data: received.freeze(),
-        }))?;
-        progress.length += data_size;
-        progress.offset += data_size;
-    }
-    outcome?;
+    let data_size = data.len();
+    file_data_tx.send(ReceivedData::Data(PartialFileData {
+        offset: progress.offset,
+        data,
+    }))?;
+    progress.length += data_size;
+    progress.offset += data_size;
 
     if progress.length != request.length {
         let msg = format!("did not expect body to contain {} bytes", progress.length);
