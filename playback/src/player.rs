@@ -46,8 +46,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::SAMPLES_PER_SECOND;
 
-const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
-
 /// How much of an upcoming track's file [`Player::prefetch`] downloads ahead:
 /// about three seconds of audio at 320 kbit/s, enough to start playing while
 /// the rest of the file streams in.
@@ -1855,6 +1853,7 @@ impl Future for PlayerInternal {
                 };
             }
 
+            let preload_before_end_ms = self.config.preload_before_end.as_millis() as i64;
             if let PlayerState::Playing {
                 ref track_id,
                 play_request_id,
@@ -1877,8 +1876,7 @@ impl Future for PlayerInternal {
                 let track_id = track_id.clone();
 
                 if (!*suggested_to_preload_next_track)
-                    && ((duration_ms as i64 - stream_position_ms as i64)
-                        < PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS as i64)
+                    && ((duration_ms as i64 - stream_position_ms as i64) < preload_before_end_ms)
                     && stream_loader_controller.range_to_end_available()
                 {
                     *suggested_to_preload_next_track = true;

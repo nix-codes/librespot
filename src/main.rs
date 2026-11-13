@@ -1862,6 +1862,7 @@ async fn get_setup() -> Setup {
             normalisation_report: None,
             ditherer,
             position_update_interval: None,
+            preload_before_end: PlayerConfig::default().preload_before_end,
             local_file_directories,
         }
     };

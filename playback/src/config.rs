@@ -135,6 +135,11 @@ pub struct PlayerConfig {
     /// Setting this will enable periodically sending events during playback informing about the playback position
     /// To consume the PlayerEvent::PositionChanged event, listen to events via `Player::get_player_event_channel()``
     pub position_update_interval: Option<Duration>,
+    /// How long before the playing track's end the player sends
+    /// [`PlayerEvent::TimeToPreloadNextTrack`](crate::player::PlayerEvent::TimeToPreloadNextTrack),
+    /// once the track is fully downloaded. A longer time leaves more room
+    /// for the next track to download before a connection is lost.
+    pub preload_before_end: Duration,
 }
 
 impl Default for PlayerConfig {
@@ -154,6 +159,7 @@ impl Default for PlayerConfig {
             passthrough: false,
             ditherer: Some(mk_ditherer::<TriangularDitherer>),
             position_update_interval: None,
+            preload_before_end: Duration::from_secs(30),
             local_file_directories: Vec::new(),
         }
     }
