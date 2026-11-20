@@ -6,7 +6,10 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::SystemTime,
 };
 
@@ -161,6 +164,14 @@ impl FsSizeLimiter {
             match entry.file_type() {
                 Ok(file_type) if file_type.is_dir() || file_type.is_symlink() => {
                     Self::init_dir(limiter, &entry.path())
+                }
+                Ok(file_type) if file_type.is_file() && is_part(&entry.path()) => {
+                    // A file a crash left half written: it was never cached.
+                    let path = entry.path();
+                    match fs::remove_file(&path) {
+                        Ok(()) => debug!("Removed unfinished cache file {path:?}"),
+                        Err(e) => warn!("Could not remove unfinished cache file {path:?}: {e}"),
+                    }
                 }
                 Ok(file_type) if file_type.is_file() => {
                     let path = entry.path();
@@ -442,22 +453,31 @@ impl Cache {
         }
     }
 
+    /// Saves a whole file to the cache. It's written under a temporary name
+    /// in the same folder, flushed and then renamed, so the cache holds the
+    /// whole file or nothing, even if the program is killed or the computer
+    /// goes down while it's written. On an error, nothing is left behind.
     pub fn save_file<F: Read>(&self, file: FileId, contents: &mut F) -> Result<PathBuf, Error> {
-        if let Some(path) = self.file_path(file) {
-            if let Some(parent) = path.parent() {
-                if let Ok(size) = fs::create_dir_all(parent)
-                    .and_then(|_| File::create(&path))
-                    .and_then(|mut file| io::copy(contents, &mut file))
-                {
-                    if let Some(limiter) = self.size_limiter.as_deref() {
-                        limiter.add(&path, size);
-                        limiter.prune()?;
-                    }
-                    return Ok(path);
-                }
+        let path = self.file_path(file).ok_or(CacheError::Path)?;
+        let parent = path.parent().ok_or(CacheError::Path)?;
+        fs::create_dir_all(parent)?;
+        let part = part_path(&path);
+        let size = match write_whole(&part, contents).and_then(|size| {
+            fs::rename(&part, &path)?;
+            Ok(size)
+        }) {
+            Ok(size) => size,
+            Err(e) => {
+                let _ = fs::remove_file(&part);
+                return Err(e.into());
             }
+        };
+        sync_dir(parent);
+        if let Some(limiter) = self.size_limiter.as_deref() {
+            limiter.add(&path, size);
+            limiter.prune()?;
         }
-        Err(CacheError::Path.into())
+        Ok(path)
     }
 
     pub fn remove_file(&self, file: FileId) -> Result<(), Error> {
@@ -470,6 +490,42 @@ impl Cache {
 
         Ok(())
     }
+}
+
+/// The ending of a file being written to the cache, not yet whole.
+const PART_EXTENSION: &str = "part";
+
+/// A name of its own beside `path` to write it under, so two saves of the
+/// same file at once can't write into one another.
+fn part_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".{}-{n}.{PART_EXTENSION}", std::process::id()));
+    path.with_file_name(name)
+}
+
+fn is_part(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == PART_EXTENSION)
+}
+
+/// Writes all of `contents` to a new file at `path` and flushes it to disk.
+fn write_whole<F: Read>(path: &Path, contents: &mut F) -> io::Result<u64> {
+    let mut file = File::create(path)?;
+    let size = io::copy(contents, &mut file)?;
+    file.sync_all()?;
+    Ok(size)
+}
+
+/// Flushes a folder's entries, so a rename in it lasts a power cut. Only
+/// where a folder can be opened for that; elsewhere the rename stands as is.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Err(e) = File::open(dir).and_then(|dir| dir.sync_all()) {
+        debug!("Could not flush cache folder {dir:?}: {e}");
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 #[cfg(test)]
@@ -554,5 +610,86 @@ mod test {
         limiter.add(Path::new("f"), 500, ordered_time(2));
         assert!(limiter.remove(Path::new("c")));
         assert!(!limiter.exceeds_limit());
+    }
+
+    /// A folder of its own under the temp folder for one test.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "librespot-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Every file under `dir`, relative to it.
+    fn files_in(dir: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_in(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// Gives some bytes, then fails, like a disk filling up mid-copy.
+    struct Failing(usize);
+
+    impl Read for Failing {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0 == 0 {
+                return Err(io::Error::other("disk full"));
+            }
+            let n = self.0.min(buf.len());
+            buf[..n].fill(7);
+            self.0 -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_saved_file_is_whole_under_its_name_with_nothing_else_left() {
+        let root = test_dir("save-whole");
+        let cache = Cache::new(None, None, Some(&root), Some(1 << 20)).unwrap();
+        let file = FileId::from_raw(&[0xab; 20]);
+        let contents = vec![3u8; 10_000];
+        let path = cache.save_file(file, &mut contents.as_slice()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), contents);
+        assert_eq!(files_in(&root), vec![path]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_save_failing_midway_leaves_nothing() {
+        let root = test_dir("save-failing");
+        let cache = Cache::new(None, None, Some(&root), Some(1 << 20)).unwrap();
+        let file = FileId::from_raw(&[0xcd; 20]);
+        assert!(cache.save_file(file, &mut Failing(5_000)).is_err());
+        assert!(files_in(&root).is_empty());
+        assert!(cache.file(file).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_file_left_half_written_is_removed_at_start_and_the_rest_kept() {
+        let root = test_dir("save-leftover");
+        let folder = root.join("ab");
+        fs::create_dir_all(&folder).unwrap();
+        let whole = folder.join("abababababababababababababababababab");
+        let left = part_path(&whole);
+        fs::write(&whole, [1u8; 100]).unwrap();
+        fs::write(&left, [2u8; 50]).unwrap();
+        let _cache = Cache::new(None, None, Some(&root), Some(1 << 20)).unwrap();
+        assert_eq!(files_in(&root), vec![whole]);
+        fs::remove_dir_all(root).unwrap();
     }
 }
