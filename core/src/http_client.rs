@@ -15,7 +15,7 @@ use hyper::{HeaderMap, Request, Response, StatusCode, body::Incoming, header::US
 use hyper_proxy2::{Intercept, Proxy, ProxyConnector};
 use hyper_util::{
     client::legacy::{Client, ResponseFuture, connect::HttpConnector},
-    rt::TokioExecutor,
+    rt::{TokioExecutor, TokioTimer},
 };
 use nonzero_ext::nonzero;
 use thiserror::Error;
@@ -93,6 +93,11 @@ impl From<HttpClientError> for Error {
     }
 }
 
+/// How often an HTTP/2 connection is pinged, to notice one gone dead.
+const HTTP2_PING_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a ping waits for its answer before the connection is closed.
+const HTTP2_PING_TIMEOUT: Duration = Duration::from_secs(5);
+
 type HyperClient = Client<ProxyConnector<HttpsConnector<HttpConnector>>, Full<bytes::Bytes>>;
 
 pub struct HttpClient {
@@ -168,8 +173,17 @@ impl HttpClient {
         };
         let proxy_connector = ProxyConnector::from_proxy(https_connector, proxy)?;
 
+        // A connection left on an address the computer no longer has (the
+        // network changed) never answers again, and the system takes many
+        // minutes to give up on it: every request sent on it until then
+        // waits. A ping it doesn't answer in time closes it, and the next
+        // request opens a new one.
         let client = Client::builder(TokioExecutor::new())
             .http2_adaptive_window(true)
+            .timer(TokioTimer::new())
+            .http2_keep_alive_interval(HTTP2_PING_INTERVAL)
+            .http2_keep_alive_timeout(HTTP2_PING_TIMEOUT)
+            .http2_keep_alive_while_idle(true)
             .build(proxy_connector);
         Ok(client)
     }
