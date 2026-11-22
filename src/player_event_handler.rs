@@ -50,10 +50,12 @@ impl EventHandler {
                                     UniqueFields::Track {
                                         artists,
                                         album,
+                                        album_id,
                                         album_artists,
                                         popularity,
                                         number,
                                         disc_number,
+                                        release_date,
                                     } => {
                                         env_vars.insert("ITEM_TYPE", "Track".to_string());
                                         env_vars.insert(
@@ -67,6 +69,10 @@ impl EventHandler {
                                         );
                                         env_vars.insert("ALBUM_ARTISTS", album_artists.join("\n"));
                                         env_vars.insert("ALBUM", album);
+                                        env_vars.insert("ALBUM_ID", album_id.to_uri());
+                                        if let Some(date) = release_date {
+                                            env_vars.insert("RELEASE_DATE", date);
+                                        }
                                         env_vars.insert("POPULARITY", popularity.to_string());
                                         env_vars.insert("NUMBER", number.to_string());
                                         env_vars.insert("DISC_NUMBER", disc_number.to_string());

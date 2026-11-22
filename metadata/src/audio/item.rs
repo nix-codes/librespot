@@ -45,10 +45,13 @@ pub enum UniqueFields {
     Track {
         artists: ArtistsWithRole,
         album: String,
+        album_id: SpotifyUri,
         album_artists: Vec<String>,
         popularity: u8,
         number: u32,
         disc_number: u32,
+        /// The album's release date (see `Album::release_date`).
+        release_date: Option<String>,
     },
     Local {
         // artists / album_artists can't be a Vec here, they are retrieved from metadata as a String,
@@ -88,6 +91,8 @@ impl AudioItem {
                 }
 
                 let uri_string = uri.to_uri();
+                let release_date = track.album.release_date;
+                let album_id = track.album.id;
                 let album = track.album.name;
 
                 let album_artists = track
@@ -123,10 +128,12 @@ impl AudioItem {
                 let unique_fields = UniqueFields::Track {
                     artists: track.artists_with_role,
                     album,
+                    album_id,
                     album_artists,
                     popularity,
                     number,
                     disc_number,
+                    release_date,
                 };
 
                 Ok(Self {

@@ -20,6 +20,7 @@ use crate::{
 use librespot_core::{Error, Session, SpotifyUri, date::Date};
 
 use librespot_protocol as protocol;
+use protocol::metadata::Date as DateMessage;
 use protocol::metadata::Disc as DiscMessage;
 pub use protocol::metadata::album::Type as AlbumType;
 
@@ -31,6 +32,9 @@ pub struct Album {
     pub album_type: AlbumType,
     pub label: String,
     pub date: Date,
+    /// When it came out, as precisely as Spotify says: "2020",
+    /// "2020-03" or "2020-03-13". `date` fills what's missing with 1s.
+    pub release_date: Option<String>,
     pub popularity: i32,
     pub covers: Images,
     pub external_ids: ExternalIds,
@@ -87,6 +91,21 @@ impl Metadata for Album {
     }
 }
 
+/// A date as precisely as it's given: a year, a month or a day.
+fn release_date(date: &DateMessage) -> Option<String> {
+    if !date.has_year() {
+        return None;
+    }
+    let mut text = format!("{:04}", date.year());
+    if date.has_month() {
+        text += &format!("-{:02}", date.month());
+        if date.has_day() {
+            text += &format!("-{:02}", date.day());
+        }
+    }
+    Some(text)
+}
+
 impl TryFrom<&<Self as Metadata>::Message> for Album {
     type Error = librespot_core::Error;
     fn try_from(album: &<Self as Metadata>::Message) -> Result<Self, Self::Error> {
@@ -97,6 +116,7 @@ impl TryFrom<&<Self as Metadata>::Message> for Album {
             album_type: album.type_(),
             label: album.label().to_owned(),
             date: album.date.get_or_default().try_into()?,
+            release_date: album.date.as_ref().and_then(release_date),
             popularity: album.popularity(),
             covers: album.cover_group.get_or_default().into(),
             external_ids: album.external_id.as_slice().into(),
